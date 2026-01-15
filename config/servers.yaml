@@ -1,0 +1,29 @@
+# n8n Updater Configuration
+# Copy this file to servers.yaml and fill in your values
+
+servers:
+  - name: "Production 1"
+    host: "1.2.3.4"
+    port: 22
+    user: "root"
+    ssh_key: "/root/.ssh/id_rsa"
+    n8n_path: "/opt/n8n-docker-caddy"
+    
+  - name: "Production 2"
+    host: "5.6.7.8"
+    port: 22
+    user: "root"
+    ssh_key: "/root/.ssh/id_rsa"
+    n8n_path: "/opt/n8n-docker-caddy"
+
+telegram:
+  # Get token from @BotFather
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+  # Your Telegram user ID (bot will tell you on /start)
+  admin_chat_id: 123456789
+
+# How often to check for new n8n versions (in hours)
+check_interval_hours: 6
+
+# Timezone for scheduling updates
+timezone: "Europe/Moscow"

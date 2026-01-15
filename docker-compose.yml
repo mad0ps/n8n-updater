@@ -1,0 +1,17 @@
+services:
+  n8n-updater:
+    build: .
+    container_name: n8n-updater
+    restart: unless-stopped
+    volumes:
+      # Database and data storage
+      - ./data:/app/data
+      # SSH keys for server access (if using key-based auth)
+      - ~/.ssh:/root/.ssh:ro
+    environment:
+      - TZ=Europe/Moscow
+      # Set your bot token here or use .env file
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+    # Optional: use .env file for the token
+    env_file:
+      - .env

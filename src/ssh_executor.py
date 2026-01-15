@@ -1,0 +1,472 @@
+"""SSH executor for running commands on remote servers."""
+
+import asyncio
+import logging
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import paramiko
+
+from .storage import Server
+from .version_checker import parse_version
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CommandResult:
+    """Result of executing a command on a remote server."""
+    
+    success: bool
+    stdout: str
+    stderr: str
+    exit_code: int
+    
+    @property
+    def output(self) -> str:
+        """Combined stdout and stderr."""
+        parts = []
+        if self.stdout.strip():
+            parts.append(self.stdout.strip())
+        if self.stderr.strip():
+            parts.append(self.stderr.strip())
+        return "\n".join(parts)
+
+
+@dataclass
+class UpdateResult:
+    """Result of updating n8n on a server."""
+    
+    server_name: str
+    server_id: Optional[int]
+    success: bool
+    old_version: Optional[str]
+    new_version: Optional[str]
+    message: str
+    details: str = ""
+
+
+class SSHExecutor:
+    """Execute commands on remote servers via SSH."""
+    
+    def __init__(self, server: Server):
+        self.server = server
+        self._client: Optional[paramiko.SSHClient] = None
+    
+    def _get_client(self) -> paramiko.SSHClient:
+        """Get or create SSH client connection."""
+        if self._client is not None:
+            # Check if connection is still alive
+            try:
+                transport = self._client.get_transport()
+                if transport and transport.is_active():
+                    return self._client
+            except Exception:
+                pass
+            
+            # Connection dead, close and reconnect
+            self._close()
+        
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        connect_kwargs = {
+            "hostname": self.server.host,
+            "port": self.server.port,
+            "username": self.server.user,
+            "timeout": 30,
+            "banner_timeout": 30,
+        }
+        
+        # Choose authentication method
+        if self.server.auth_type == "key" and self.server.ssh_key_path:
+            # Key-based authentication
+            key_path = Path(self.server.ssh_key_path)
+            if not key_path.exists():
+                raise FileNotFoundError(f"SSH key not found: {self.server.ssh_key_path}")
+            
+            # Try different key types
+            pkey = None
+            for key_class in [paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey]:
+                try:
+                    pkey = key_class.from_private_key_file(str(key_path))
+                    break
+                except paramiko.ssh_exception.SSHException:
+                    continue
+            
+            if pkey is None:
+                raise ValueError(f"Could not load SSH key: {self.server.ssh_key_path}")
+            
+            connect_kwargs["pkey"] = pkey
+            
+        elif self.server.auth_type == "password" and self.server.ssh_password:
+            # Password-based authentication
+            connect_kwargs["password"] = self.server.ssh_password
+            connect_kwargs["look_for_keys"] = False
+            connect_kwargs["allow_agent"] = False
+        else:
+            raise ValueError(f"Invalid auth configuration for server {self.server.name}")
+        
+        client.connect(**connect_kwargs)
+        
+        self._client = client
+        return client
+    
+    def _close(self):
+        """Close SSH connection."""
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
+    
+    async def execute(self, command: str, timeout: int = 300) -> CommandResult:
+        """
+        Execute a command on the remote server.
+        
+        Args:
+            command: Shell command to execute.
+            timeout: Command timeout in seconds.
+            
+        Returns:
+            CommandResult with output and exit code.
+        """
+        def _exec():
+            try:
+                client = self._get_client()
+                stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+                
+                exit_code = stdout.channel.recv_exit_status()
+                stdout_text = stdout.read().decode("utf-8", errors="replace")
+                stderr_text = stderr.read().decode("utf-8", errors="replace")
+                
+                return CommandResult(
+                    success=exit_code == 0,
+                    stdout=stdout_text,
+                    stderr=stderr_text,
+                    exit_code=exit_code
+                )
+            except Exception as e:
+                return CommandResult(
+                    success=False,
+                    stdout="",
+                    stderr=str(e),
+                    exit_code=-1
+                )
+        
+        # Run in thread pool to not block async loop
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _exec)
+    
+    async def get_current_version(self) -> Optional[str]:
+        """
+        Get current n8n version running on the server.
+        
+        Returns:
+            Version string like "1.70.0" or None if not found.
+        """
+        # Try to get version from running container
+        command = f"cd {self.server.n8n_path} && docker compose ps --format json n8n 2>/dev/null || docker-compose ps --format json n8n 2>/dev/null"
+        result = await self.execute(command)
+        
+        if not result.success:
+            # Try alternative: get image tag from compose file or running container
+            command = f"docker ps --filter 'name=n8n' --format '{{{{.Image}}}}' | head -1"
+            result = await self.execute(command)
+        
+        if result.success and result.stdout.strip():
+            # Extract version from image name like "n8nio/n8n:1.70.0"
+            image = result.stdout.strip().split("\n")[0]
+            if ":" in image:
+                version = image.split(":")[-1]
+                if parse_version(version):
+                    return version
+        
+        # Try getting version from n8n CLI
+        command = f"cd {self.server.n8n_path} && docker compose exec -T n8n n8n --version 2>/dev/null || docker-compose exec -T n8n n8n --version 2>/dev/null"
+        result = await self.execute(command, timeout=30)
+        
+        if result.success and result.stdout.strip():
+            # Parse version from output like "1.70.0"
+            version_match = re.search(r"(\d+\.\d+\.\d+)", result.stdout)
+            if version_match:
+                return version_match.group(1)
+        
+        return None
+    
+    async def check_n8n_running(self) -> bool:
+        """Check if n8n container is running and healthy."""
+        command = f"cd {self.server.n8n_path} && docker compose ps --status running 2>/dev/null | grep -q n8n || docker-compose ps 2>/dev/null | grep -q 'Up'"
+        result = await self.execute(command, timeout=30)
+        return result.success
+    
+    async def check_docker_installed(self) -> bool:
+        """Check if Docker is installed and accessible."""
+        result = await self.execute("docker --version", timeout=10)
+        return result.success
+    
+    async def check_n8n_path_exists(self) -> bool:
+        """Check if n8n path exists on the server."""
+        result = await self.execute(f"test -d {self.server.n8n_path}", timeout=10)
+        return result.success
+    
+    async def update_n8n(self) -> UpdateResult:
+        """
+        Update n8n to the latest version.
+        
+        Returns:
+            UpdateResult with status and details.
+        """
+        server_name = self.server.name
+        server_id = self.server.id
+        details_parts = []
+        backup_name = None
+        
+        try:
+            # Get current version before update
+            old_version = await self.get_current_version()
+            details_parts.append(f"Old version: {old_version or 'unknown'}")
+            
+            # === BACKUP N8N DATA ===
+            logger.info(f"[{server_name}] Creating backup of n8n data...")
+            timestamp = "$(date +%Y%m%d_%H%M%S)"
+            
+            # Find n8n data directory (check common locations)
+            find_data_cmd = f"""
+            cd {self.server.n8n_path} && \
+            if [ -d ".n8n" ]; then echo ".n8n"; \
+            elif [ -d "n8n_data" ]; then echo "n8n_data"; \
+            elif [ -d "data" ]; then echo "data"; \
+            else echo ""; fi
+            """
+            result = await self.execute(find_data_cmd, timeout=30)
+            data_dir = result.stdout.strip() if result.success else ""
+            
+            # Create backup directory
+            backup_dir = f"{self.server.n8n_path}/backups"
+            await self.execute(f"mkdir -p {backup_dir}", timeout=30)
+            
+            # Backup docker-compose.yml
+            backup_compose_cmd = f"cd {self.server.n8n_path} && cp docker-compose.yml {backup_dir}/docker-compose.yml.{timestamp}"
+            await self.execute(backup_compose_cmd, timeout=30)
+            
+            # Backup n8n data if found
+            if data_dir:
+                backup_name = f"n8n_backup_{timestamp}.tar.gz"
+                backup_data_cmd = f"cd {self.server.n8n_path} && tar -czf {backup_dir}/{backup_name} {data_dir} 2>/dev/null"
+                result = await self.execute(backup_data_cmd, timeout=300)  # 5 min for large backups
+                if result.success:
+                    details_parts.append(f"Data backup: {backup_name}")
+                    logger.info(f"[{server_name}] Backup created: {backup_name}")
+                else:
+                    details_parts.append("Data backup failed (continuing anyway)")
+                    logger.warning(f"[{server_name}] Backup failed: {result.stderr}")
+            else:
+                details_parts.append("No data dir found, skipping data backup")
+            
+            details_parts.append("Config backup created")
+            
+            # === UPDATE DOCKER-COMPOSE.YML ===
+            logger.info(f"[{server_name}] Updating image tag to latest...")
+            
+            # First, let's see current image line
+            check_image_cmd = f"cd {self.server.n8n_path} && grep -E 'image.*n8n' docker-compose.yml"
+            result = await self.execute(check_image_cmd, timeout=30)
+            current_image = result.stdout.strip()
+            logger.info(f"[{server_name}] Current image line: {current_image}")
+            details_parts.append(f"Current: {current_image}")
+            
+            # Update image to use Docker Hub (not docker.n8n.io which lags behind)
+            # Replace docker.n8n.io/n8nio/n8n with n8nio/n8n:latest
+            # This ensures we get the latest version from Docker Hub
+            
+            # Replace docker.n8n.io/n8nio/n8n... with n8nio/n8n:latest
+            update_cmd = f"cd {self.server.n8n_path} && sed -i.bak -E 's|docker\\.n8n\\.io/n8nio/n8n(:[^ ]*)?|n8nio/n8n:latest|g' docker-compose.yml"
+            result = await self.execute(update_cmd, timeout=30)
+            
+            # Also handle if it was already n8nio/n8n without docker.n8n.io prefix
+            update_cmd2 = f"cd {self.server.n8n_path} && sed -i.bak -E 's|([^/])n8nio/n8n(:[^ ]*)?|\\1n8nio/n8n:latest|g' docker-compose.yml"
+            await self.execute(update_cmd2, timeout=30)
+            
+            # Check what it looks like now
+            check_image_cmd = f"cd {self.server.n8n_path} && grep -E 'image.*n8n' docker-compose.yml"
+            result = await self.execute(check_image_cmd, timeout=30)
+            new_image = result.stdout.strip()
+            logger.info(f"[{server_name}] Updated image line: {new_image}")
+            details_parts.append(f"Updated to: {new_image}")
+            
+            # === PULL NEW IMAGE ===
+            logger.info(f"[{server_name}] Pulling new n8n image from Docker Hub...")
+            
+            # Force pull from Docker Hub (not docker.n8n.io which lags behind!)
+            force_pull_cmd = "docker pull n8nio/n8n:latest 2>&1"
+            result = await self.execute(force_pull_cmd, timeout=600)
+            if result.success:
+                logger.info(f"[{server_name}] Force pull output: {result.stdout[:200]}")
+                details_parts.append("Latest image pulled")
+            else:
+                logger.warning(f"[{server_name}] Force pull failed: {result.stderr}")
+            
+            # Now do compose pull
+            pull_cmd = f"cd {self.server.n8n_path} && docker compose pull 2>&1 || docker-compose pull 2>&1"
+            result = await self.execute(pull_cmd, timeout=600)  # 10 min for pull
+            
+            if not result.success:
+                return UpdateResult(
+                    server_name=server_name,
+                    server_id=server_id,
+                    success=False,
+                    old_version=old_version,
+                    new_version=None,
+                    message="Failed to pull new image",
+                    details=result.output
+                )
+            details_parts.append("Image pulled successfully")
+            
+            # Stop containers
+            logger.info(f"[{server_name}] Stopping n8n...")
+            down_cmd = f"cd {self.server.n8n_path} && docker compose down 2>&1 || docker-compose down 2>&1"
+            result = await self.execute(down_cmd, timeout=120)
+            
+            if not result.success:
+                return UpdateResult(
+                    server_name=server_name,
+                    server_id=server_id,
+                    success=False,
+                    old_version=old_version,
+                    new_version=None,
+                    message="Failed to stop containers",
+                    details=result.output
+                )
+            details_parts.append("Containers stopped")
+            
+            # Start containers
+            logger.info(f"[{server_name}] Starting n8n...")
+            up_cmd = f"cd {self.server.n8n_path} && docker compose up -d 2>&1 || docker-compose up -d 2>&1"
+            result = await self.execute(up_cmd, timeout=120)
+            
+            if not result.success:
+                return UpdateResult(
+                    server_name=server_name,
+                    server_id=server_id,
+                    success=False,
+                    old_version=old_version,
+                    new_version=None,
+                    message="Failed to start containers",
+                    details=result.output
+                )
+            details_parts.append("Containers started")
+            
+            # Wait for container to be ready
+            await asyncio.sleep(10)
+            
+            # Verify n8n is running
+            if not await self.check_n8n_running():
+                return UpdateResult(
+                    server_name=server_name,
+                    server_id=server_id,
+                    success=False,
+                    old_version=old_version,
+                    new_version=None,
+                    message="n8n container failed to start",
+                    details="\n".join(details_parts)
+                )
+            
+            # Get new version
+            new_version = await self.get_current_version()
+            details_parts.append(f"New version: {new_version or 'unknown'}")
+            
+            return UpdateResult(
+                server_name=server_name,
+                server_id=server_id,
+                success=True,
+                old_version=old_version,
+                new_version=new_version,
+                message="Update completed successfully",
+                details="\n".join(details_parts)
+            )
+            
+        except Exception as e:
+            logger.exception(f"[{server_name}] Update failed with exception")
+            return UpdateResult(
+                server_name=server_name,
+                server_id=server_id,
+                success=False,
+                old_version=None,
+                new_version=None,
+                message=f"Update failed: {str(e)}",
+                details="\n".join(details_parts)
+            )
+        finally:
+            self._close()
+    
+    async def test_connection(self) -> tuple[bool, str]:
+        """
+        Test SSH connection to the server.
+        
+        Returns:
+            Tuple of (success, message).
+        """
+        try:
+            result = await self.execute("echo 'Connection OK'", timeout=30)
+            if result.success:
+                return True, "Connection successful"
+            else:
+                return False, f"Command failed: {result.stderr}"
+        except Exception as e:
+            return False, f"Connection failed: {str(e)}"
+        finally:
+            self._close()
+
+
+async def get_server_status(server: Server) -> dict:
+    """
+    Get status information for a server.
+    
+    Returns:
+        Dict with server status info.
+    """
+    executor = SSHExecutor(server)
+    
+    try:
+        connected, conn_msg = await executor.test_connection()
+        
+        if not connected:
+            return {
+                "id": server.id,
+                "name": server.name,
+                "host": server.host,
+                "connected": False,
+                "error": conn_msg,
+                "version": None,
+                "running": False
+            }
+        
+        version = await executor.get_current_version()
+        running = await executor.check_n8n_running()
+        
+        return {
+            "id": server.id,
+            "name": server.name,
+            "host": server.host,
+            "connected": True,
+            "version": version,
+            "running": running,
+            "error": None
+        }
+        
+    except Exception as e:
+        return {
+            "id": server.id,
+            "name": server.name,
+            "host": server.host,
+            "connected": False,
+            "error": str(e),
+            "version": None,
+            "running": False
+        }
+    finally:
+        executor._close()

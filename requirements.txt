@@ -1,0 +1,16 @@
+# Telegram Bot
+aiogram>=3.15.0
+
+# SSH
+paramiko>=3.5.0
+
+# Scheduler
+apscheduler>=3.10.4
+
+# Config
+pyyaml>=6.0.2
+pydantic>=2.10.0
+pydantic-settings>=2.7.0
+
+# Async utilities
+asyncio-atexit>=1.0.1
