@@ -47,6 +47,22 @@ class UpdateResult:
     new_version: Optional[str]
     message: str
     details: str = ""
+    # Backup info for rollback
+    compose_backup_path: Optional[str] = None
+    data_backup_path: Optional[str] = None
+    can_rollback: bool = False
+
+
+@dataclass
+class RollbackResult:
+    """Result of rolling back n8n."""
+    
+    server_name: str
+    server_id: Optional[int]
+    success: bool
+    restored_version: Optional[str]
+    message: str
+    details: str = ""
 
 
 class SSHExecutor:
@@ -224,7 +240,9 @@ class SSHExecutor:
         server_name = self.server.name
         server_id = self.server.id
         details_parts = []
-        backup_name = None
+        compose_backup_path = None
+        data_backup_path = None
+        old_version = None
         
         try:
             # Get current version before update
@@ -233,7 +251,10 @@ class SSHExecutor:
             
             # === BACKUP N8N DATA ===
             logger.info(f"[{server_name}] Creating backup of n8n data...")
-            timestamp = "$(date +%Y%m%d_%H%M%S)"
+            
+            # Get real timestamp from server
+            timestamp_result = await self.execute("date +%Y%m%d_%H%M%S", timeout=10)
+            timestamp = timestamp_result.stdout.strip() if timestamp_result.success else "backup"
             
             # Find n8n data directory (check common locations)
             find_data_cmd = f"""
@@ -251,24 +272,26 @@ class SSHExecutor:
             await self.execute(f"mkdir -p {backup_dir}", timeout=30)
             
             # Backup docker-compose.yml
-            backup_compose_cmd = f"cd {self.server.n8n_path} && cp docker-compose.yml {backup_dir}/docker-compose.yml.{timestamp}"
+            compose_backup_path = f"{backup_dir}/docker-compose.yml.{timestamp}"
+            backup_compose_cmd = f"cd {self.server.n8n_path} && cp docker-compose.yml {compose_backup_path}"
             await self.execute(backup_compose_cmd, timeout=30)
             
             # Backup n8n data if found
             if data_dir:
-                backup_name = f"n8n_backup_{timestamp}.tar.gz"
-                backup_data_cmd = f"cd {self.server.n8n_path} && tar -czf {backup_dir}/{backup_name} {data_dir} 2>/dev/null"
+                data_backup_path = f"{backup_dir}/n8n_backup_{timestamp}.tar.gz"
+                backup_data_cmd = f"cd {self.server.n8n_path} && tar -czf {data_backup_path} {data_dir} 2>/dev/null"
                 result = await self.execute(backup_data_cmd, timeout=300)  # 5 min for large backups
                 if result.success:
-                    details_parts.append(f"Data backup: {backup_name}")
-                    logger.info(f"[{server_name}] Backup created: {backup_name}")
+                    details_parts.append(f"Data backup: {data_backup_path}")
+                    logger.info(f"[{server_name}] Backup created: {data_backup_path}")
                 else:
                     details_parts.append("Data backup failed (continuing anyway)")
+                    data_backup_path = None
                     logger.warning(f"[{server_name}] Backup failed: {result.stderr}")
             else:
                 details_parts.append("No data dir found, skipping data backup")
             
-            details_parts.append("Config backup created")
+            details_parts.append(f"Config backup: {compose_backup_path}")
             
             # === UPDATE DOCKER-COMPOSE.YML ===
             logger.info(f"[{server_name}] Updating image tag to latest...")
@@ -323,7 +346,10 @@ class SSHExecutor:
                     old_version=old_version,
                     new_version=None,
                     message="Failed to pull new image",
-                    details=result.output
+                    details=result.output,
+                    compose_backup_path=compose_backup_path,
+                    data_backup_path=data_backup_path,
+                    can_rollback=bool(compose_backup_path)
                 )
             details_parts.append("Image pulled successfully")
             
@@ -340,7 +366,10 @@ class SSHExecutor:
                     old_version=old_version,
                     new_version=None,
                     message="Failed to stop containers",
-                    details=result.output
+                    details=result.output,
+                    compose_backup_path=compose_backup_path,
+                    data_backup_path=data_backup_path,
+                    can_rollback=bool(compose_backup_path)
                 )
             details_parts.append("Containers stopped")
             
@@ -357,7 +386,10 @@ class SSHExecutor:
                     old_version=old_version,
                     new_version=None,
                     message="Failed to start containers",
-                    details=result.output
+                    details=result.output,
+                    compose_backup_path=compose_backup_path,
+                    data_backup_path=data_backup_path,
+                    can_rollback=bool(compose_backup_path)
                 )
             details_parts.append("Containers started")
             
@@ -373,7 +405,10 @@ class SSHExecutor:
                     old_version=old_version,
                     new_version=None,
                     message="n8n container failed to start",
-                    details="\n".join(details_parts)
+                    details="\n".join(details_parts),
+                    compose_backup_path=compose_backup_path,
+                    data_backup_path=data_backup_path,
+                    can_rollback=bool(compose_backup_path)
                 )
             
             # Get new version
@@ -387,7 +422,10 @@ class SSHExecutor:
                 old_version=old_version,
                 new_version=new_version,
                 message="Update completed successfully",
-                details="\n".join(details_parts)
+                details="\n".join(details_parts),
+                compose_backup_path=compose_backup_path,
+                data_backup_path=data_backup_path,
+                can_rollback=False  # Success - no rollback needed
             )
             
         except Exception as e:
@@ -396,10 +434,13 @@ class SSHExecutor:
                 server_name=server_name,
                 server_id=server_id,
                 success=False,
-                old_version=None,
+                old_version=old_version,
                 new_version=None,
                 message=f"Update failed: {str(e)}",
-                details="\n".join(details_parts)
+                details="\n".join(details_parts),
+                compose_backup_path=compose_backup_path,
+                data_backup_path=data_backup_path,
+                can_rollback=bool(compose_backup_path)
             )
         finally:
             self._close()
@@ -419,6 +460,147 @@ class SSHExecutor:
                 return False, f"Command failed: {result.stderr}"
         except Exception as e:
             return False, f"Connection failed: {str(e)}"
+        finally:
+            self._close()
+    
+    async def rollback_n8n(
+        self,
+        compose_backup_path: str,
+        data_backup_path: Optional[str] = None
+    ) -> RollbackResult:
+        """
+        Rollback n8n to previous version using backup files.
+        
+        Args:
+            compose_backup_path: Path to docker-compose.yml backup
+            data_backup_path: Path to data backup tar.gz (optional)
+            
+        Returns:
+            RollbackResult with status and details.
+        """
+        server_name = self.server.name
+        server_id = self.server.id
+        details_parts = []
+        
+        try:
+            logger.info(f"[{server_name}] Starting rollback...")
+            
+            # Stop containers first
+            logger.info(f"[{server_name}] Stopping containers...")
+            down_cmd = f"cd {self.server.n8n_path} && docker compose down 2>&1 || docker-compose down 2>&1"
+            result = await self.execute(down_cmd, timeout=120)
+            
+            if not result.success:
+                return RollbackResult(
+                    server_name=server_name,
+                    server_id=server_id,
+                    success=False,
+                    restored_version=None,
+                    message="Failed to stop containers for rollback",
+                    details=result.output
+                )
+            details_parts.append("Containers stopped")
+            
+            # Restore docker-compose.yml
+            logger.info(f"[{server_name}] Restoring docker-compose.yml...")
+            restore_compose_cmd = f"cp {compose_backup_path} {self.server.n8n_path}/docker-compose.yml"
+            result = await self.execute(restore_compose_cmd, timeout=30)
+            
+            if not result.success:
+                return RollbackResult(
+                    server_name=server_name,
+                    server_id=server_id,
+                    success=False,
+                    restored_version=None,
+                    message="Failed to restore docker-compose.yml",
+                    details=result.output
+                )
+            details_parts.append("docker-compose.yml restored")
+            
+            # Restore data if backup exists
+            if data_backup_path:
+                logger.info(f"[{server_name}] Restoring data from backup...")
+                
+                # Check if backup file exists
+                check_cmd = f"test -f {data_backup_path}"
+                if (await self.execute(check_cmd, timeout=10)).success:
+                    # Extract backup (will overwrite existing data)
+                    restore_data_cmd = f"cd {self.server.n8n_path} && tar -xzf {data_backup_path}"
+                    result = await self.execute(restore_data_cmd, timeout=300)
+                    
+                    if result.success:
+                        details_parts.append("Data restored from backup")
+                    else:
+                        details_parts.append(f"Data restore failed: {result.stderr}")
+                        logger.warning(f"[{server_name}] Data restore failed: {result.stderr}")
+                else:
+                    details_parts.append("Data backup file not found, skipping")
+            
+            # Pull the old image (from restored compose file)
+            logger.info(f"[{server_name}] Pulling image from restored config...")
+            pull_cmd = f"cd {self.server.n8n_path} && docker compose pull 2>&1 || docker-compose pull 2>&1"
+            result = await self.execute(pull_cmd, timeout=600)
+            
+            if result.success:
+                details_parts.append("Image pulled")
+            else:
+                details_parts.append(f"Image pull warning: {result.stderr[:100]}")
+            
+            # Start containers
+            logger.info(f"[{server_name}] Starting containers...")
+            up_cmd = f"cd {self.server.n8n_path} && docker compose up -d 2>&1 || docker-compose up -d 2>&1"
+            result = await self.execute(up_cmd, timeout=120)
+            
+            if not result.success:
+                return RollbackResult(
+                    server_name=server_name,
+                    server_id=server_id,
+                    success=False,
+                    restored_version=None,
+                    message="Failed to start containers after rollback",
+                    details="\n".join(details_parts) + f"\n{result.output}"
+                )
+            details_parts.append("Containers started")
+            
+            # Wait for container to be ready
+            await asyncio.sleep(10)
+            
+            # Verify n8n is running
+            if not await self.check_n8n_running():
+                return RollbackResult(
+                    server_name=server_name,
+                    server_id=server_id,
+                    success=False,
+                    restored_version=None,
+                    message="n8n container failed to start after rollback",
+                    details="\n".join(details_parts)
+                )
+            
+            # Get restored version
+            restored_version = await self.get_current_version()
+            details_parts.append(f"Restored version: {restored_version or 'unknown'}")
+            
+            logger.info(f"[{server_name}] Rollback completed successfully")
+            
+            return RollbackResult(
+                server_name=server_name,
+                server_id=server_id,
+                success=True,
+                restored_version=restored_version,
+                message="Rollback completed successfully",
+                details="\n".join(details_parts)
+            )
+            
+        except Exception as e:
+            logger.exception(f"[{server_name}] Rollback failed with exception")
+            return RollbackResult(
+                server_name=server_name,
+                server_id=server_id,
+                success=False,
+                restored_version=None,
+                message=f"Rollback failed: {str(e)}",
+                details="\n".join(details_parts)
+            )
         finally:
             self._close()
 

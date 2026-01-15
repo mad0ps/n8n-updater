@@ -14,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 from ..storage import get_storage, Server
 from ..version_checker import get_latest_version, compare_versions
-from ..ssh_executor import SSHExecutor, get_server_status, UpdateResult, perform_full_health_check, check_n8n_health
+from ..ssh_executor import SSHExecutor, get_server_status, UpdateResult, RollbackResult, perform_full_health_check, check_n8n_health
 from .keyboards import (
     get_main_menu,
     get_servers_menu,
@@ -33,6 +33,8 @@ from .keyboards import (
     get_monitoring_keyboard,
     get_history_keyboard,
     get_history_detail_keyboard,
+    get_rollback_keyboard,
+    get_rollback_result_keyboard,
 )
 
 if TYPE_CHECKING:
@@ -1107,6 +1109,90 @@ async def cb_toggle_monitoring(callback: CallbackQuery):
     await callback.answer()
 
 
+# ============= Rollback Handlers =============
+
+@router.callback_query(F.data.startswith("rollback_confirm:"))
+@admin_only
+async def cb_rollback_confirm(callback: CallbackQuery):
+    """Confirm and execute rollback."""
+    parts = callback.data.split(":")
+    server_id = int(parts[1])
+    backup_id = int(parts[2])
+    
+    storage = get_storage()
+    server = storage.get_server(server_id)
+    backup = storage.get_backup(backup_id)
+    
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+    
+    if not backup:
+        await callback.answer("Бэкап не найден", show_alert=True)
+        return
+    
+    await callback.answer("Начинаю откат...")
+    
+    await callback.message.edit_text(
+        f"⏪ *Откат {server.name}*\n\n"
+        f"Восстанавливаю версию {backup.get('old_version', 'unknown')}...\n"
+        "Это может занять несколько минут.",
+        parse_mode="Markdown"
+    )
+    
+    # Execute rollback
+    executor = SSHExecutor(server)
+    result = await executor.rollback_n8n(
+        compose_backup_path=backup["compose_backup_path"],
+        data_backup_path=backup.get("data_backup_path")
+    )
+    
+    # Mark backup as used
+    storage.mark_backup_used(backup_id)
+    
+    if result.success:
+        await callback.message.edit_text(
+            f"✅ *Откат выполнен успешно!*\n\n"
+            f"**Сервер:** {server.name}\n"
+            f"**Восстановленная версия:** v{result.restored_version or 'unknown'}\n\n"
+            f"Сервер работает.",
+            parse_mode="Markdown",
+            reply_markup=get_rollback_result_keyboard()
+        )
+    else:
+        await callback.message.edit_text(
+            f"❌ *Откат не удался*\n\n"
+            f"**Сервер:** {server.name}\n"
+            f"**Ошибка:** {result.message}\n\n"
+            f"Детали: {result.details[:200] if result.details else 'нет'}",
+            parse_mode="Markdown",
+            reply_markup=get_rollback_result_keyboard()
+        )
+
+
+@router.callback_query(F.data.startswith("rollback_skip:"))
+@admin_only
+async def cb_rollback_skip(callback: CallbackQuery):
+    """Skip rollback, leave server as is."""
+    parts = callback.data.split(":")
+    server_id = int(parts[1])
+    backup_id = int(parts[2])
+    
+    storage = get_storage()
+    server = storage.get_server(server_id)
+    
+    server_name = server.name if server else "Сервер"
+    
+    await callback.message.edit_text(
+        f"ℹ️ *Откат отменён*\n\n"
+        f"**{server_name}** оставлен в текущем состоянии.\n\n"
+        f"Бэкап сохранён, можешь откатить позже вручную.",
+        parse_mode="Markdown",
+        reply_markup=get_back_keyboard()
+    )
+    await callback.answer()
+
+
 # ============= Update Flow =============
 
 @router.callback_query(F.data.startswith("select_server:"))
@@ -1470,6 +1556,8 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
     
     # Execute updates
     results: list[UpdateResult] = []
+    failed_with_rollback: list[tuple[UpdateResult, int]] = []  # (result, backup_id)
+    
     for server in servers:
         await message.edit_text(
             f"🔄 *Обновление серверов*\n\n"
@@ -1481,6 +1569,23 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
         executor = SSHExecutor(server)
         result = await executor.update_n8n()
         results.append(result)
+        
+        # Save backup info if available
+        backup_id = None
+        if result.compose_backup_path:
+            backup_id = storage.save_backup_info(
+                server_id=server.id,
+                server_name=server.name,
+                compose_backup_path=result.compose_backup_path,
+                data_backup_path=result.data_backup_path,
+                old_version=result.old_version or ""
+            )
+            # Clean up old backups (keep last 3)
+            storage.delete_old_backups(server.id, keep_count=3)
+        
+        # Track failed updates that can be rolled back
+        if not result.success and result.can_rollback and backup_id:
+            failed_with_rollback.append((result, backup_id))
         
         # Save to history
         storage.add_update_history(
@@ -1516,5 +1621,18 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
         parse_mode="Markdown",
         reply_markup=get_back_keyboard()
     )
+    
+    # Offer rollback for failed updates
+    for result, backup_id in failed_with_rollback:
+        server = storage.get_server_by_name(result.server_name)
+        if server:
+            await message.answer(
+                f"⚠️ *Обновление {result.server_name} не удалось*\n\n"
+                f"**Ошибка:** {result.message}\n"
+                f"**Предыдущая версия:** v{result.old_version or 'unknown'}\n\n"
+                f"Хочешь откатить к предыдущей версии?",
+                parse_mode="Markdown",
+                reply_markup=get_rollback_keyboard(server.id, backup_id)
+            )
     
     return results

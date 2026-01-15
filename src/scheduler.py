@@ -242,8 +242,7 @@ class UpdateScheduler:
                 old_version=result.old_version or "",
                 new_version=result.new_version or "",
                 success=result.success,
-                message=result.message,
-                details=result.details
+                message=result.message
             )
         
         # Send results
@@ -312,3 +311,118 @@ class UpdateScheduler:
     async def force_check(self):
         """Force an immediate version check."""
         await self._check_for_updates()
+    
+    # ============= Server Monitoring =============
+    
+    async def start_monitoring(self):
+        """Start periodic server health monitoring."""
+        try:
+            self.scheduler.remove_job(self._monitoring_job_id)
+        except Exception:
+            pass
+        
+        self.scheduler.add_job(
+            self._check_servers_health,
+            IntervalTrigger(minutes=5),
+            id=self._monitoring_job_id,
+            name="Server health monitoring",
+            replace_existing=True
+        )
+        
+        logger.info("Server monitoring started (every 5 minutes)")
+        
+        # Run initial check
+        asyncio.create_task(self._delayed_health_check())
+    
+    async def _delayed_health_check(self):
+        """Run initial health check after a short delay."""
+        await asyncio.sleep(10)
+        await self._check_servers_health()
+    
+    def stop_monitoring(self):
+        """Stop server health monitoring."""
+        try:
+            self.scheduler.remove_job(self._monitoring_job_id)
+            logger.info("Server monitoring stopped")
+        except Exception:
+            pass
+    
+    async def _check_servers_health(self):
+        """Check health of all servers and notify on issues."""
+        logger.info("Running server health check...")
+        
+        storage = get_storage()
+        admin_id = storage.get_admin_chat_id()
+        
+        if not admin_id:
+            logger.warning("No admin configured, skipping health check")
+            return
+        
+        servers = storage.get_all_servers()
+        if not servers:
+            logger.info("No servers configured, skipping health check")
+            return
+        
+        # Check each server
+        for server in servers:
+            try:
+                result = await perform_full_health_check(server)
+                
+                # Update health status in database
+                storage.update_server_health(
+                    server_id=server.id,
+                    server_name=server.name,
+                    is_healthy=result.is_healthy,
+                    error_message=result.error
+                )
+                
+                if result.is_healthy:
+                    logger.debug(f"Server {server.name}: healthy")
+                else:
+                    logger.warning(f"Server {server.name}: unhealthy - {result.error}")
+                    
+            except Exception as e:
+                logger.exception(f"Error checking health for {server.name}: {e}")
+                storage.update_server_health(
+                    server_id=server.id,
+                    server_name=server.name,
+                    is_healthy=False,
+                    error_message=str(e)
+                )
+        
+        # Check for servers that need notification (failed 2+ times and not yet notified)
+        unhealthy_servers = storage.get_unhealthy_servers_for_notification(min_failures=2)
+        
+        if unhealthy_servers:
+            await self._send_health_alert(admin_id, unhealthy_servers)
+            
+            # Mark as notified
+            for server in unhealthy_servers:
+                storage.mark_server_notified(server["server_id"])
+    
+    async def _send_health_alert(self, chat_id: int, unhealthy_servers: list[dict]):
+        """Send health alert notification."""
+        lines = ["🚨 *Проблемы с серверами!*\n"]
+        
+        for server in unhealthy_servers:
+            error = server.get("error_message", "Неизвестная ошибка")
+            failures = server.get("consecutive_failures", 0)
+            lines.append(
+                f"🔴 *{server['server_name']}*\n"
+                f"   └ {error}\n"
+                f"   └ Неудачных проверок: {failures}"
+            )
+        
+        lines.append("\nИспользуй /status для деталей.")
+        
+        try:
+            from .bot.keyboards import get_main_menu
+            await self.bot.send_message(
+                chat_id,
+                "\n".join(lines),
+                parse_mode="Markdown",
+                reply_markup=get_main_menu(has_servers=True)
+            )
+            logger.info(f"Health alert sent for {len(unhealthy_servers)} server(s)")
+        except Exception as e:
+            logger.error(f"Failed to send health alert: {e}")

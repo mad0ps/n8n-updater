@@ -356,3 +356,37 @@ def get_cancel_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"),
     )
     return builder.as_markup()
+
+
+def get_rollback_keyboard(server_id: int, backup_id: int) -> InlineKeyboardMarkup:
+    """Get keyboard for rollback confirmation after failed update."""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(
+            text="⏪ Откатить к предыдущей версии",
+            callback_data=f"rollback_confirm:{server_id}:{backup_id}"
+        ),
+    )
+    builder.row(
+        InlineKeyboardButton(
+            text="❌ Оставить как есть",
+            callback_data=f"rollback_skip:{server_id}:{backup_id}"
+        ),
+    )
+    
+    return builder.as_markup()
+
+
+def get_rollback_result_keyboard() -> InlineKeyboardMarkup:
+    """Get keyboard after rollback result."""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="📊 Статус серверов", callback_data="status"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu"),
+    )
+    
+    return builder.as_markup()

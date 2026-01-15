@@ -138,6 +138,18 @@ class Storage:
                     FOREIGN KEY (server_id) REFERENCES servers(id),
                     UNIQUE(server_id)
                 );
+                
+                CREATE TABLE IF NOT EXISTS backups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id INTEGER NOT NULL,
+                    server_name TEXT NOT NULL,
+                    compose_backup_path TEXT,
+                    data_backup_path TEXT,
+                    old_version TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    used INTEGER DEFAULT 0,
+                    FOREIGN KEY (server_id) REFERENCES servers(id)
+                );
             """)
             
             # Add n8n_url column if it doesn't exist (for existing databases)
@@ -410,6 +422,65 @@ class Storage:
                 "UPDATE server_health SET notified = 1 WHERE server_id = ?",
                 (server_id,)
             )
+    
+    # ============= Backup Management =============
+    
+    def save_backup_info(
+        self,
+        server_id: int,
+        server_name: str,
+        compose_backup_path: str,
+        data_backup_path: Optional[str],
+        old_version: str
+    ) -> int:
+        """Save backup information. Returns backup ID."""
+        with self._get_connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO backups 
+                (server_id, server_name, compose_backup_path, data_backup_path, old_version)
+                VALUES (?, ?, ?, ?, ?)
+            """, (server_id, server_name, compose_backup_path, data_backup_path, old_version))
+            return cursor.lastrowid
+    
+    def get_backup(self, backup_id: int) -> Optional[dict]:
+        """Get backup by ID."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM backups WHERE id = ?", (backup_id,)
+            ).fetchone()
+            return dict(row) if row else None
+    
+    def get_last_backup(self, server_id: int) -> Optional[dict]:
+        """Get the most recent unused backup for a server."""
+        with self._get_connection() as conn:
+            row = conn.execute("""
+                SELECT * FROM backups 
+                WHERE server_id = ? AND used = 0
+                ORDER BY created_at DESC 
+                LIMIT 1
+            """, (server_id,)).fetchone()
+            return dict(row) if row else None
+    
+    def mark_backup_used(self, backup_id: int):
+        """Mark backup as used (after rollback)."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE backups SET used = 1 WHERE id = ?",
+                (backup_id,)
+            )
+    
+    def delete_old_backups(self, server_id: int, keep_count: int = 3):
+        """Delete old backups, keeping only the most recent ones."""
+        with self._get_connection() as conn:
+            conn.execute("""
+                DELETE FROM backups 
+                WHERE server_id = ? AND id NOT IN (
+                    SELECT id FROM backups 
+                    WHERE server_id = ? 
+                    ORDER BY created_at DESC 
+                    LIMIT ?
+                )
+            """, (server_id, server_id, keep_count))
 
 
 # Global storage instance
