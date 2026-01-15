@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
 import paramiko
 
 from .storage import Server
@@ -442,11 +443,17 @@ async def get_server_status(server: Server) -> dict:
                 "connected": False,
                 "error": conn_msg,
                 "version": None,
-                "running": False
+                "running": False,
+                "ui_healthy": False
             }
         
         version = await executor.get_current_version()
         running = await executor.check_n8n_running()
+        
+        # Check UI health if URL is configured
+        ui_healthy = None
+        if server.n8n_url:
+            ui_healthy, _ = await check_n8n_health(server.n8n_url)
         
         return {
             "id": server.id,
@@ -455,6 +462,7 @@ async def get_server_status(server: Server) -> dict:
             "connected": True,
             "version": version,
             "running": running,
+            "ui_healthy": ui_healthy,
             "error": None
         }
         
@@ -466,7 +474,130 @@ async def get_server_status(server: Server) -> dict:
             "connected": False,
             "error": str(e),
             "version": None,
-            "running": False
+            "running": False,
+            "ui_healthy": False
         }
+    finally:
+        executor._close()
+
+
+@dataclass
+class HealthCheckResult:
+    """Result of health check."""
+    server_id: int
+    server_name: str
+    is_healthy: bool
+    ssh_ok: bool
+    container_running: bool
+    ui_accessible: bool
+    version: Optional[str]
+    error: Optional[str]
+
+
+async def check_n8n_health(url: str, timeout: int = 10) -> tuple[bool, Optional[str]]:
+    """
+    Check if n8n UI is accessible via HTTP.
+    
+    Args:
+        url: n8n instance URL (e.g., https://n8n.example.com)
+        timeout: Request timeout in seconds
+        
+    Returns:
+        Tuple of (is_healthy, error_message)
+    """
+    try:
+        # Normalize URL
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+        
+        # Try the healthz endpoint first, then fall back to root
+        endpoints = ["/healthz", "/rest/health", "/"]
+        
+        async with aiohttp.ClientSession() as session:
+            for endpoint in endpoints:
+                try:
+                    check_url = url.rstrip("/") + endpoint
+                    async with session.get(
+                        check_url,
+                        timeout=aiohttp.ClientTimeout(total=timeout),
+                        ssl=False  # Allow self-signed certs
+                    ) as response:
+                        if response.status < 500:
+                            return True, None
+                except aiohttp.ClientError:
+                    continue
+            
+            return False, "All health endpoints failed"
+            
+    except asyncio.TimeoutError:
+        return False, "Connection timeout"
+    except aiohttp.ClientError as e:
+        return False, f"Connection error: {str(e)}"
+    except Exception as e:
+        return False, f"Health check failed: {str(e)}"
+
+
+async def perform_full_health_check(server: Server) -> HealthCheckResult:
+    """
+    Perform a comprehensive health check on a server.
+    
+    Checks:
+    1. SSH connectivity
+    2. Docker container running
+    3. n8n UI accessible (if URL configured)
+    
+    Returns:
+        HealthCheckResult with all check statuses
+    """
+    result = HealthCheckResult(
+        server_id=server.id,
+        server_name=server.name,
+        is_healthy=False,
+        ssh_ok=False,
+        container_running=False,
+        ui_accessible=False,
+        version=None,
+        error=None
+    )
+    
+    executor = SSHExecutor(server)
+    
+    try:
+        # Check SSH
+        connected, ssh_error = await executor.test_connection()
+        result.ssh_ok = connected
+        
+        if not connected:
+            result.error = f"SSH: {ssh_error}"
+            return result
+        
+        # Check container
+        result.container_running = await executor.check_n8n_running()
+        
+        if not result.container_running:
+            result.error = "n8n container is not running"
+            return result
+        
+        # Get version
+        result.version = await executor.get_current_version()
+        
+        # Check UI if URL configured
+        if server.n8n_url:
+            result.ui_accessible, ui_error = await check_n8n_health(server.n8n_url)
+            if not result.ui_accessible:
+                result.error = f"UI: {ui_error}"
+                result.is_healthy = False
+                return result
+        else:
+            # No URL configured, skip UI check
+            result.ui_accessible = None
+        
+        # All checks passed
+        result.is_healthy = True
+        return result
+        
+    except Exception as e:
+        result.error = str(e)
+        return result
     finally:
         executor._close()

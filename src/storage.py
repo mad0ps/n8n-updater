@@ -5,6 +5,7 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +29,7 @@ class Server:
     ssh_key_path: Optional[str]  # For key auth
     ssh_password: Optional[str]  # For password auth (encrypted in future)
     n8n_path: str
+    n8n_url: Optional[str] = None  # URL for health checks (e.g., https://n8n.example.com)
     
     def to_dict(self) -> dict:
         return asdict(self)
@@ -43,7 +45,8 @@ class Server:
             auth_type=row["auth_type"],
             ssh_key_path=row["ssh_key_path"],
             ssh_password=row["ssh_password"],
-            n8n_path=row["n8n_path"]
+            n8n_path=row["n8n_path"],
+            n8n_url=row["n8n_url"] if "n8n_url" in row.keys() else None
         )
 
 
@@ -100,6 +103,7 @@ class Storage:
                     ssh_key_path TEXT,
                     ssh_password TEXT,
                     n8n_path TEXT DEFAULT '/opt/n8n-docker-caddy',
+                    n8n_url TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
                 
@@ -116,10 +120,38 @@ class Storage:
                     new_version TEXT,
                     success INTEGER,
                     message TEXT,
+                    details TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (server_id) REFERENCES servers(id)
                 );
+                
+                CREATE TABLE IF NOT EXISTS server_health (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_id INTEGER NOT NULL,
+                    server_name TEXT NOT NULL,
+                    is_healthy INTEGER DEFAULT 1,
+                    last_check TIMESTAMP,
+                    last_healthy TIMESTAMP,
+                    error_message TEXT,
+                    consecutive_failures INTEGER DEFAULT 0,
+                    notified INTEGER DEFAULT 0,
+                    FOREIGN KEY (server_id) REFERENCES servers(id),
+                    UNIQUE(server_id)
+                );
             """)
+            
+            # Add n8n_url column if it doesn't exist (for existing databases)
+            try:
+                conn.execute("ALTER TABLE servers ADD COLUMN n8n_url TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            
+            # Add details column to update_history if it doesn't exist
+            try:
+                conn.execute("ALTER TABLE update_history ADD COLUMN details TEXT")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+                
         logger.info(f"Database initialized at {self.db_path}")
     
     # ============= Server Management =============
@@ -128,8 +160,8 @@ class Storage:
         """Add a new server. Returns server ID."""
         with self._get_connection() as conn:
             cursor = conn.execute("""
-                INSERT INTO servers (name, host, port, user, auth_type, ssh_key_path, ssh_password, n8n_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO servers (name, host, port, user, auth_type, ssh_key_path, ssh_password, n8n_path, n8n_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 server.name,
                 server.host,
@@ -138,7 +170,8 @@ class Storage:
                 server.auth_type,
                 server.ssh_key_path,
                 server.ssh_password,
-                server.n8n_path
+                server.n8n_path,
+                server.n8n_url
             ))
             return cursor.lastrowid
     
@@ -173,7 +206,7 @@ class Storage:
             conn.execute("""
                 UPDATE servers 
                 SET name = ?, host = ?, port = ?, user = ?, 
-                    auth_type = ?, ssh_key_path = ?, ssh_password = ?, n8n_path = ?
+                    auth_type = ?, ssh_key_path = ?, ssh_password = ?, n8n_path = ?, n8n_url = ?
                 WHERE id = ?
             """, (
                 server.name,
@@ -184,9 +217,19 @@ class Storage:
                 server.ssh_key_path,
                 server.ssh_password,
                 server.n8n_path,
+                server.n8n_url,
                 server.id
             ))
             return True
+    
+    def update_server_url(self, server_id: int, n8n_url: str) -> bool:
+        """Update only the n8n URL for a server."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "UPDATE servers SET n8n_url = ? WHERE id = ?",
+                (n8n_url, server_id)
+            )
+            return cursor.rowcount > 0
     
     def delete_server(self, server_id: int) -> bool:
         """Delete server by ID."""
@@ -253,25 +296,120 @@ class Storage:
         old_version: str,
         new_version: str,
         success: bool,
-        message: str
+        message: str,
+        details: str = ""
     ):
         """Record an update attempt."""
         with self._get_connection() as conn:
             conn.execute("""
                 INSERT INTO update_history 
-                (server_id, server_name, old_version, new_version, success, message)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (server_id, server_name, old_version, new_version, int(success), message))
+                (server_id, server_name, old_version, new_version, success, message, details)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (server_id, server_name, old_version, new_version, int(success), message, details))
     
-    def get_update_history(self, limit: int = 20) -> list[dict]:
+    def get_update_history(self, limit: int = 20, server_id: int = None) -> list[dict]:
         """Get recent update history."""
         with self._get_connection() as conn:
-            rows = conn.execute("""
-                SELECT * FROM update_history 
-                ORDER BY created_at DESC 
-                LIMIT ?
-            """, (limit,)).fetchall()
+            if server_id:
+                rows = conn.execute("""
+                    SELECT * FROM update_history 
+                    WHERE server_id = ?
+                    ORDER BY created_at DESC 
+                    LIMIT ?
+                """, (server_id, limit)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM update_history 
+                    ORDER BY created_at DESC 
+                    LIMIT ?
+                """, (limit,)).fetchall()
             return [dict(row) for row in rows]
+    
+    def get_update_history_entry(self, entry_id: int) -> Optional[dict]:
+        """Get a specific update history entry."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM update_history WHERE id = ?", (entry_id,)
+            ).fetchone()
+            return dict(row) if row else None
+    
+    # ============= Server Health Monitoring =============
+    
+    def update_server_health(
+        self,
+        server_id: int,
+        server_name: str,
+        is_healthy: bool,
+        error_message: str = None
+    ):
+        """Update server health status."""
+        with self._get_connection() as conn:
+            now = datetime.now().isoformat()
+            
+            # Get current state
+            row = conn.execute(
+                "SELECT * FROM server_health WHERE server_id = ?", (server_id,)
+            ).fetchone()
+            
+            if row:
+                if is_healthy:
+                    conn.execute("""
+                        UPDATE server_health 
+                        SET is_healthy = 1, last_check = ?, last_healthy = ?,
+                            error_message = NULL, consecutive_failures = 0, notified = 0
+                        WHERE server_id = ?
+                    """, (now, now, server_id))
+                else:
+                    consecutive = row["consecutive_failures"] + 1
+                    conn.execute("""
+                        UPDATE server_health 
+                        SET is_healthy = 0, last_check = ?, error_message = ?,
+                            consecutive_failures = ?
+                        WHERE server_id = ?
+                    """, (now, error_message, consecutive, server_id))
+            else:
+                # Insert new record
+                last_healthy = now if is_healthy else None
+                conn.execute("""
+                    INSERT INTO server_health 
+                    (server_id, server_name, is_healthy, last_check, last_healthy, error_message, consecutive_failures)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (server_id, server_name, int(is_healthy), now, last_healthy, error_message, 0 if is_healthy else 1))
+    
+    def get_server_health(self, server_id: int) -> Optional[dict]:
+        """Get health status for a server."""
+        with self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM server_health WHERE server_id = ?", (server_id,)
+            ).fetchone()
+            return dict(row) if row else None
+    
+    def get_all_server_health(self) -> list[dict]:
+        """Get health status for all servers."""
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM server_health ORDER BY server_name"
+            ).fetchall()
+            return [dict(row) for row in rows]
+    
+    def get_unhealthy_servers_for_notification(self, min_failures: int = 2) -> list[dict]:
+        """Get unhealthy servers that need notification."""
+        with self._get_connection() as conn:
+            rows = conn.execute("""
+                SELECT * FROM server_health 
+                WHERE is_healthy = 0 
+                AND consecutive_failures >= ? 
+                AND notified = 0
+            """, (min_failures,)).fetchall()
+            return [dict(row) for row in rows]
+    
+    def mark_server_notified(self, server_id: int):
+        """Mark server as notified about failure."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE server_health SET notified = 1 WHERE server_id = ?",
+                (server_id,)
+            )
 
 
 # Global storage instance

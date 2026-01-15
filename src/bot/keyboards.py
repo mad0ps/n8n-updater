@@ -20,6 +20,9 @@ def get_main_menu(has_servers: bool = True) -> InlineKeyboardMarkup:
         builder.row(
             InlineKeyboardButton(text="🔄 Обновить серверы", callback_data="update_menu"),
         )
+        builder.row(
+            InlineKeyboardButton(text="📜 История обновлений", callback_data="history"),
+        )
     
     builder.row(
         InlineKeyboardButton(text="🖥 Управление серверами", callback_data="servers_menu"),
@@ -70,15 +73,24 @@ def get_servers_list_keyboard(servers: list[Server]) -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
-def get_server_details_keyboard(server_id: int) -> InlineKeyboardMarkup:
+def get_server_details_keyboard(server_id: int, has_url: bool = False) -> InlineKeyboardMarkup:
     """Get keyboard for server details view."""
     builder = InlineKeyboardBuilder()
     
     builder.row(
         InlineKeyboardButton(text="🔗 Проверить подключение", callback_data=f"test_server:{server_id}"),
     )
+    
+    if has_url:
+        builder.row(
+            InlineKeyboardButton(text="🩺 Health Check", callback_data=f"health_check:{server_id}"),
+        )
+    
     builder.row(
-        InlineKeyboardButton(text="✏️ Изменить", callback_data=f"edit_server:{server_id}"),
+        InlineKeyboardButton(text="🌐 Настроить URL", callback_data=f"set_url:{server_id}"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="📜 История сервера", callback_data=f"server_history:{server_id}"),
     )
     builder.row(
         InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_server:{server_id}"),
@@ -248,7 +260,60 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="⏱ Интервал проверки", callback_data="setting:interval"),
     )
     builder.row(
+        InlineKeyboardButton(text="🩺 Мониторинг серверов", callback_data="setting:monitoring"),
+    )
+    builder.row(
         InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu"),
+    )
+    
+    return builder.as_markup()
+
+
+def get_monitoring_keyboard(enabled: bool = False) -> InlineKeyboardMarkup:
+    """Get monitoring settings keyboard."""
+    builder = InlineKeyboardBuilder()
+    
+    if enabled:
+        builder.row(
+            InlineKeyboardButton(text="🔴 Выключить мониторинг", callback_data="monitoring:disable"),
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(text="🟢 Включить мониторинг", callback_data="monitoring:enable"),
+        )
+    
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_menu"),
+    )
+    
+    return builder.as_markup()
+
+
+def get_history_keyboard(has_more: bool = False, offset: int = 0) -> InlineKeyboardMarkup:
+    """Get keyboard for update history view."""
+    builder = InlineKeyboardBuilder()
+    
+    if has_more:
+        builder.row(
+            InlineKeyboardButton(text="📜 Показать ещё", callback_data=f"history:more:{offset}"),
+        )
+    
+    builder.row(
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu"),
+    )
+    
+    return builder.as_markup()
+
+
+def get_history_detail_keyboard(entry_id: int) -> InlineKeyboardMarkup:
+    """Get keyboard for history entry details."""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="⬅️ К истории", callback_data="history"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🏠 Меню", callback_data="menu"),
     )
     
     return builder.as_markup()

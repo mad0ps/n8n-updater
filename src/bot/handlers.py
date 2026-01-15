@@ -14,7 +14,7 @@ from aiogram.fsm.state import State, StatesGroup
 
 from ..storage import get_storage, Server
 from ..version_checker import get_latest_version, compare_versions
-from ..ssh_executor import SSHExecutor, get_server_status, UpdateResult
+from ..ssh_executor import SSHExecutor, get_server_status, UpdateResult, perform_full_health_check, check_n8n_health
 from .keyboards import (
     get_main_menu,
     get_servers_menu,
@@ -30,6 +30,9 @@ from .keyboards import (
     get_interval_keyboard,
     get_skip_keyboard,
     get_cancel_keyboard,
+    get_monitoring_keyboard,
+    get_history_keyboard,
+    get_history_detail_keyboard,
 )
 
 if TYPE_CHECKING:
@@ -70,6 +73,11 @@ class UpdateStates(StatesGroup):
 class SettingsStates(StatesGroup):
     """FSM states for settings."""
     waiting_interval = State()
+
+
+class ServerEditStates(StatesGroup):
+    """FSM states for editing server."""
+    waiting_url = State()
 
 
 def is_admin(user_id: int) -> bool:
@@ -295,15 +303,16 @@ async def cb_server_details(callback: CallbackQuery):
         return
     
     auth_info = "🔑 Пароль" if server.auth_type == "password" else f"🔐 SSH ключ"
+    url_info = f"\n**URL:** `{server.n8n_url}`" if server.n8n_url else "\n**URL:** не настроен"
     
     await callback.message.edit_text(
         f"🖥 *{server.name}*\n\n"
         f"**Хост:** `{server.host}:{server.port}`\n"
         f"**Пользователь:** `{server.user}`\n"
         f"**Авторизация:** {auth_info}\n"
-        f"**Путь n8n:** `{server.n8n_path}`",
+        f"**Путь n8n:** `{server.n8n_path}`{url_info}",
         parse_mode="Markdown",
-        reply_markup=get_server_details_keyboard(server_id)
+        reply_markup=get_server_details_keyboard(server_id, has_url=bool(server.n8n_url))
     )
     await callback.answer()
 
@@ -683,6 +692,306 @@ async def finish_add_server(message: Message, state: FSMContext, edit: bool = Fa
         )
 
 
+# ============= Update History =============
+
+@router.callback_query(F.data == "history")
+@admin_only
+async def cb_history(callback: CallbackQuery):
+    """Show update history."""
+    storage = get_storage()
+    history = storage.get_update_history(limit=10)
+    
+    if not history:
+        await callback.message.edit_text(
+            "📜 *История обновлений*\n\n"
+            "История пуста. Обновлений ещё не было.",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard()
+        )
+        await callback.answer()
+        return
+    
+    lines = ["📜 *История обновлений*\n"]
+    
+    for entry in history:
+        date = entry["created_at"][:16].replace("T", " ")
+        status = "✅" if entry["success"] else "❌"
+        version_info = ""
+        if entry["old_version"] and entry["new_version"]:
+            if entry["old_version"] != entry["new_version"]:
+                version_info = f"v{entry['old_version']} → v{entry['new_version']}"
+            else:
+                version_info = f"v{entry['new_version']}"
+        elif entry["new_version"]:
+            version_info = f"v{entry['new_version']}"
+        
+        lines.append(
+            f"{status} `{date}`\n"
+            f"   └ {entry['server_name']} {version_info}"
+        )
+    
+    has_more = len(history) == 10
+    
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=get_history_keyboard(has_more=has_more, offset=10)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("history:more:"))
+@admin_only
+async def cb_history_more(callback: CallbackQuery):
+    """Load more history entries."""
+    offset = int(callback.data.split(":")[2])
+    storage = get_storage()
+    history = storage.get_update_history(limit=10)
+    
+    # For simplicity, just show from beginning with higher limit
+    history = storage.get_update_history(limit=offset + 10)
+    
+    if not history:
+        await callback.answer("Больше записей нет")
+        return
+    
+    lines = ["📜 *История обновлений*\n"]
+    
+    for entry in history:
+        date = entry["created_at"][:16].replace("T", " ")
+        status = "✅" if entry["success"] else "❌"
+        version_info = ""
+        if entry["old_version"] and entry["new_version"]:
+            if entry["old_version"] != entry["new_version"]:
+                version_info = f"v{entry['old_version']} → v{entry['new_version']}"
+            else:
+                version_info = f"v{entry['new_version']}"
+        elif entry["new_version"]:
+            version_info = f"v{entry['new_version']}"
+        
+        lines.append(
+            f"{status} `{date}`\n"
+            f"   └ {entry['server_name']} {version_info}"
+        )
+    
+    has_more = len(history) == offset + 10
+    
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=get_history_keyboard(has_more=has_more, offset=offset + 10)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("server_history:"))
+@admin_only
+async def cb_server_history(callback: CallbackQuery):
+    """Show history for a specific server."""
+    server_id = int(callback.data.split(":")[1])
+    storage = get_storage()
+    server = storage.get_server(server_id)
+    
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+    
+    history = storage.get_update_history(limit=10, server_id=server_id)
+    
+    if not history:
+        await callback.message.edit_text(
+            f"📜 *История обновлений: {server.name}*\n\n"
+            "История пуста.",
+            parse_mode="Markdown",
+            reply_markup=get_server_details_keyboard(server_id, has_url=bool(server.n8n_url))
+        )
+        await callback.answer()
+        return
+    
+    lines = [f"📜 *История: {server.name}*\n"]
+    
+    for entry in history:
+        date = entry["created_at"][:16].replace("T", " ")
+        status = "✅" if entry["success"] else "❌"
+        version_info = ""
+        if entry["old_version"] and entry["new_version"]:
+            if entry["old_version"] != entry["new_version"]:
+                version_info = f"v{entry['old_version']} → v{entry['new_version']}"
+            else:
+                version_info = f"v{entry['new_version']}"
+        
+        msg = entry.get("message", "")[:50]
+        lines.append(f"{status} `{date}` {version_info}\n   └ {msg}")
+    
+    lines.append("")
+    
+    await callback.message.edit_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=get_server_details_keyboard(server_id, has_url=bool(server.n8n_url))
+    )
+    await callback.answer()
+
+
+# ============= Health Check =============
+
+@router.callback_query(F.data.startswith("health_check:"))
+@admin_only
+async def cb_health_check(callback: CallbackQuery):
+    """Perform health check on a server."""
+    server_id = int(callback.data.split(":")[1])
+    storage = get_storage()
+    server = storage.get_server(server_id)
+    
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+    
+    await callback.answer("Выполняю health check...")
+    
+    await callback.message.edit_text(
+        f"🩺 Проверяю здоровье *{server.name}*...",
+        parse_mode="Markdown"
+    )
+    
+    result = await perform_full_health_check(server)
+    
+    # Update health in database
+    storage.update_server_health(
+        server_id=server.id,
+        server_name=server.name,
+        is_healthy=result.is_healthy,
+        error_message=result.error
+    )
+    
+    # Format result
+    ssh_status = "✅" if result.ssh_ok else "❌"
+    container_status = "✅" if result.container_running else "❌"
+    
+    if result.ui_accessible is None:
+        ui_status = "⚪ (URL не настроен)"
+    else:
+        ui_status = "✅" if result.ui_accessible else "❌"
+    
+    overall = "🟢 Здоров" if result.is_healthy else "🔴 Проблемы"
+    
+    text = (
+        f"🩺 *Health Check: {server.name}*\n\n"
+        f"**Статус:** {overall}\n\n"
+        f"**SSH подключение:** {ssh_status}\n"
+        f"**Контейнер запущен:** {container_status}\n"
+        f"**UI доступен:** {ui_status}\n"
+    )
+    
+    if result.version:
+        text += f"**Версия:** v{result.version}\n"
+    
+    if result.error:
+        text += f"\n**Ошибка:** {result.error}"
+    
+    await callback.message.edit_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=get_server_details_keyboard(server_id, has_url=bool(server.n8n_url))
+    )
+
+
+# ============= Server URL Configuration =============
+
+@router.callback_query(F.data.startswith("set_url:"))
+@admin_only
+async def cb_set_url(callback: CallbackQuery, state: FSMContext):
+    """Start URL configuration for a server."""
+    server_id = int(callback.data.split(":")[1])
+    storage = get_storage()
+    server = storage.get_server(server_id)
+    
+    if not server:
+        await callback.answer("Сервер не найден", show_alert=True)
+        return
+    
+    await state.update_data(url_server_id=server_id)
+    await state.set_state(ServerEditStates.waiting_url)
+    
+    current_url = f"\n\nТекущий URL: `{server.n8n_url}`" if server.n8n_url else ""
+    
+    await callback.message.edit_text(
+        f"🌐 *Настройка URL для {server.name}*\n\n"
+        f"Введи URL твоего n8n (например: `https://n8n.example.com`).\n"
+        f"Это нужно для проверки доступности UI.{current_url}\n\n"
+        f"Или отправь `-` чтобы удалить URL.",
+        parse_mode="Markdown",
+        reply_markup=get_cancel_keyboard()
+    )
+    await callback.answer()
+
+
+@router.message(ServerEditStates.waiting_url)
+async def process_server_url(message: Message, state: FSMContext):
+    """Process server URL input."""
+    data = await state.get_data()
+    server_id = data.get("url_server_id")
+    
+    if not server_id:
+        await state.clear()
+        await message.answer("Ошибка: сервер не найден", reply_markup=get_back_keyboard())
+        return
+    
+    storage = get_storage()
+    server = storage.get_server(server_id)
+    
+    if not server:
+        await state.clear()
+        await message.answer("Ошибка: сервер не найден", reply_markup=get_back_keyboard())
+        return
+    
+    url = message.text.strip()
+    
+    if url == "-":
+        # Remove URL
+        storage.update_server_url(server_id, None)
+        await state.clear()
+        await message.answer(
+            f"✅ URL для *{server.name}* удалён.",
+            parse_mode="Markdown",
+            reply_markup=get_server_details_keyboard(server_id, has_url=False)
+        )
+        return
+    
+    # Validate URL format
+    if not url.startswith(("http://", "https://")):
+        url = f"https://{url}"
+    
+    # Test the URL
+    await message.answer(f"🔄 Проверяю доступность {url}...")
+    
+    is_healthy, error = await check_n8n_health(url)
+    
+    # Save URL regardless of health check result
+    storage.update_server_url(server_id, url)
+    await state.clear()
+    
+    if is_healthy:
+        await message.answer(
+            f"✅ URL настроен и проверен!\n\n"
+            f"**Сервер:** {server.name}\n"
+            f"**URL:** `{url}`\n"
+            f"**Статус:** 🟢 Доступен",
+            parse_mode="Markdown",
+            reply_markup=get_server_details_keyboard(server_id, has_url=True)
+        )
+    else:
+        await message.answer(
+            f"⚠️ URL сохранён, но проверка не прошла\n\n"
+            f"**Сервер:** {server.name}\n"
+            f"**URL:** `{url}`\n"
+            f"**Ошибка:** {error}\n\n"
+            f"Возможно, URL правильный, но сервер временно недоступен.",
+            parse_mode="Markdown",
+            reply_markup=get_server_details_keyboard(server_id, has_url=True)
+        )
+
+
 # ============= Settings =============
 
 @router.callback_query(F.data == "settings_menu")
@@ -691,10 +1000,14 @@ async def cb_settings_menu(callback: CallbackQuery):
     """Show settings menu."""
     storage = get_storage()
     interval = storage.get_check_interval()
+    monitoring_enabled = storage.get_setting("monitoring_enabled", "0") == "1"
+    
+    monitoring_status = "🟢 Включён" if monitoring_enabled else "🔴 Выключен"
     
     await callback.message.edit_text(
         f"⚙️ *Настройки*\n\n"
-        f"**Интервал проверки обновлений:** {interval} ч",
+        f"**Интервал проверки обновлений:** {interval} ч\n"
+        f"**Мониторинг серверов:** {monitoring_status}",
         parse_mode="Markdown",
         reply_markup=get_settings_keyboard()
     )
@@ -731,6 +1044,66 @@ async def cb_set_interval(callback: CallbackQuery):
         parse_mode="Markdown",
         reply_markup=get_back_keyboard()
     )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "setting:monitoring")
+@admin_only
+async def cb_setting_monitoring(callback: CallbackQuery):
+    """Show monitoring settings."""
+    storage = get_storage()
+    monitoring_enabled = storage.get_setting("monitoring_enabled", "0") == "1"
+    
+    status = "🟢 Включён" if monitoring_enabled else "🔴 Выключен"
+    
+    await callback.message.edit_text(
+        f"🩺 *Мониторинг серверов*\n\n"
+        f"**Статус:** {status}\n\n"
+        f"Когда мониторинг включён, бот каждые 5 минут проверяет:\n"
+        f"• SSH подключение к серверам\n"
+        f"• Работу контейнера n8n\n"
+        f"• Доступность UI (если настроен URL)\n\n"
+        f"При проблемах бот отправит уведомление.",
+        parse_mode="Markdown",
+        reply_markup=get_monitoring_keyboard(enabled=monitoring_enabled)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("monitoring:"))
+@admin_only
+async def cb_toggle_monitoring(callback: CallbackQuery):
+    """Toggle monitoring on/off."""
+    action = callback.data.split(":")[1]
+    storage = get_storage()
+    
+    if action == "enable":
+        storage.set_setting("monitoring_enabled", "1")
+        
+        # Start monitoring in scheduler
+        if _scheduler:
+            await _scheduler.start_monitoring()
+        
+        await callback.message.edit_text(
+            "✅ *Мониторинг включён!*\n\n"
+            "Бот будет проверять серверы каждые 5 минут и уведомлять о проблемах.\n\n"
+            "Для проверки доступности UI не забудь настроить URL для каждого сервера.",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard()
+        )
+    else:
+        storage.set_setting("monitoring_enabled", "0")
+        
+        # Stop monitoring in scheduler
+        if _scheduler:
+            _scheduler.stop_monitoring()
+        
+        await callback.message.edit_text(
+            "🔴 *Мониторинг выключен*",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard()
+        )
+    
     await callback.answer()
 
 
@@ -1116,7 +1489,8 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
             old_version=result.old_version or "",
             new_version=result.new_version or "",
             success=result.success,
-            message=result.message
+            message=result.message,
+            details=result.details
         )
     
     # Format results

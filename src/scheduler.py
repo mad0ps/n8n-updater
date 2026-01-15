@@ -13,7 +13,7 @@ from aiogram import Bot
 
 from .storage import get_storage, Server
 from .version_checker import get_latest_version, compare_versions
-from .ssh_executor import SSHExecutor, get_server_status, UpdateResult
+from .ssh_executor import SSHExecutor, get_server_status, UpdateResult, perform_full_health_check
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,7 @@ class UpdateScheduler:
         self.bot = bot
         self.scheduler = AsyncIOScheduler()
         self._version_check_job_id = "version_check"
+        self._monitoring_job_id = "server_monitoring"
     
     async def start(self):
         """Start the scheduler."""
@@ -42,6 +43,10 @@ class UpdateScheduler:
         
         self.scheduler.start()
         logger.info(f"Scheduler started. Checking for updates every {interval} hours.")
+        
+        # Start monitoring if enabled
+        if storage.get_setting("monitoring_enabled", "0") == "1":
+            await self.start_monitoring()
         
         # Run initial check after a short delay
         asyncio.create_task(self._delayed_initial_check())
@@ -237,7 +242,8 @@ class UpdateScheduler:
                 old_version=result.old_version or "",
                 new_version=result.new_version or "",
                 success=result.success,
-                message=result.message
+                message=result.message,
+                details=result.details
             )
         
         # Send results
