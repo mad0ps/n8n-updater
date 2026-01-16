@@ -10,6 +10,7 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 DOCKER_HUB_API = "https://hub.docker.com/v2/repositories/n8nio/n8n/tags"
+GITHUB_RELEASES_API = "https://api.github.com/repos/n8n-io/n8n/releases/tags"
 N8N_IMAGE = "n8nio/n8n"
 
 # Regex for semantic versioning (e.g., 1.70.0, 1.70.1)
@@ -213,3 +214,121 @@ def compare_versions(current: str, latest: str) -> int:
         return 0
     else:
         return 1
+
+
+@dataclass
+class ReleaseInfo:
+    """Information about an n8n release from GitHub."""
+    
+    version: str
+    name: str
+    changelog: str
+    url: str
+    published_at: Optional[str] = None
+
+
+async def get_release_changelog(version: str, max_length: int = 1500) -> Optional[ReleaseInfo]:
+    """
+    Get release changelog from GitHub for a specific version.
+    
+    Args:
+        version: Version string like "1.70.0"
+        max_length: Maximum length of changelog text
+        
+    Returns:
+        ReleaseInfo with changelog or None if not found.
+    """
+    # n8n uses tag format: n8n@version
+    tag = f"n8n@{version}"
+    url = f"{GITHUB_RELEASES_API}/{tag}"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            headers = {"Accept": "application/vnd.github.v3+json"}
+            async with session.get(url, headers=headers) as response:
+                if response.status == 404:
+                    logger.debug(f"Release not found for tag {tag}")
+                    return None
+                    
+                if response.status != 200:
+                    logger.error(f"GitHub API returned {response.status}")
+                    return None
+                
+                data = await response.json()
+        
+        body = data.get("body", "")
+        
+        # Clean up markdown for Telegram
+        changelog = _format_changelog_for_telegram(body, max_length)
+        
+        return ReleaseInfo(
+            version=version,
+            name=data.get("name", f"n8n {version}"),
+            changelog=changelog,
+            url=data.get("html_url", f"https://github.com/n8n-io/n8n/releases/tag/{tag}"),
+            published_at=data.get("published_at")
+        )
+        
+    except aiohttp.ClientError as e:
+        logger.error(f"Failed to fetch release from GitHub: {e}")
+        return None
+    except Exception as e:
+        logger.exception(f"Unexpected error fetching release: {e}")
+        return None
+
+
+def _format_changelog_for_telegram(body: str, max_length: int) -> str:
+    """
+    Format GitHub release body for Telegram message.
+    
+    Cleans up markdown and truncates if needed.
+    """
+    if not body:
+        return ""
+    
+    lines = []
+    
+    for line in body.split("\n"):
+        line = line.strip()
+        
+        # Skip empty lines at start
+        if not lines and not line:
+            continue
+        
+        # Skip "What's Changed" header - redundant
+        if line.lower() in ("## what's changed", "### what's changed"):
+            continue
+        
+        # Convert ### headers to bold
+        if line.startswith("### "):
+            line = f"*{line[4:]}*"
+        elif line.startswith("## "):
+            line = f"*{line[3:]}*"
+        
+        # Convert * bullet to •
+        if line.startswith("* "):
+            line = "• " + line[2:]
+        elif line.startswith("- "):
+            line = "• " + line[2:]
+        
+        # Remove markdown links but keep text: [text](url) -> text
+        line = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', line)
+        
+        # Remove @mentions and PR numbers for cleaner look
+        line = re.sub(r'by @\w+ in #\d+', '', line)
+        line = re.sub(r'by @\w+', '', line)
+        line = re.sub(r'#\d+', '', line)
+        
+        # Clean up extra spaces
+        line = re.sub(r'\s+', ' ', line).strip()
+        
+        if line:
+            lines.append(line)
+    
+    result = "\n".join(lines)
+    
+    # Truncate if needed
+    if len(result) > max_length:
+        result = result[:max_length].rsplit("\n", 1)[0] + "\n..."
+    
+    return result

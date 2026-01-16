@@ -12,7 +12,7 @@ from apscheduler.triggers.date import DateTrigger
 from aiogram import Bot
 
 from .storage import get_storage, Server
-from .version_checker import get_latest_version, compare_versions
+from .version_checker import get_latest_version, compare_versions, get_release_changelog
 from .ssh_executor import SSHExecutor, get_server_status, UpdateResult, perform_full_health_check
 
 logger = logging.getLogger(__name__)
@@ -142,13 +142,22 @@ class UpdateScheduler:
             logger.exception(f"Error checking for updates: {e}")
     
     async def _send_update_notification(self, chat_id: int, latest_version: str, servers: list[dict]):
-        """Send notification about available updates."""
+        """Send notification about available updates with changelog."""
+        
+        # Try to get changelog from GitHub
+        release_info = await get_release_changelog(latest_version)
+        
         lines = [
-            f"🆕 *Доступна новая версия n8n!*\n\n"
-            f"Версия: `{latest_version}`\n\n"
-            "Серверы, требующие обновления:"
+            f"🆕 *Доступна новая версия n8n!*\n",
+            f"Версия: `{latest_version}`"
         ]
         
+        # Add changelog if available
+        if release_info and release_info.changelog:
+            lines.append(f"\n📋 *Что нового:*\n{release_info.changelog}")
+            lines.append(f"\n🔗 [Подробнее на GitHub]({release_info.url})")
+        
+        lines.append("\n*Серверы, требующие обновления:*")
         for server in servers:
             lines.append(f"   • {server['name']}: v{server['version']}")
         
@@ -160,7 +169,8 @@ class UpdateScheduler:
                 chat_id,
                 "\n".join(lines),
                 parse_mode="Markdown",
-                reply_markup=get_main_menu(has_servers=True)
+                reply_markup=get_main_menu(has_servers=True),
+                disable_web_page_preview=True
             )
             logger.info(f"Update notification sent for version {latest_version}")
         except Exception as e:
