@@ -130,6 +130,10 @@ class Storage:
                     server_id INTEGER NOT NULL,
                     server_name TEXT NOT NULL,
                     is_healthy INTEGER DEFAULT 1,
+                    ssh_ok INTEGER DEFAULT 0,
+                    container_running INTEGER DEFAULT 0,
+                    ui_accessible INTEGER DEFAULT 0,
+                    version TEXT,
                     last_check TIMESTAMP,
                     last_healthy TIMESTAMP,
                     error_message TEXT,
@@ -163,6 +167,15 @@ class Storage:
                 conn.execute("ALTER TABLE update_history ADD COLUMN details TEXT")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+            
+            # Add detailed health check columns to server_health if they don't exist
+            for col in ["ssh_ok INTEGER DEFAULT 0", "container_running INTEGER DEFAULT 0", 
+                        "ui_accessible INTEGER DEFAULT 0", "version TEXT"]:
+                col_name = col.split()[0]
+                try:
+                    conn.execute(f"ALTER TABLE server_health ADD COLUMN {col}")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
                 
         logger.info(f"Database initialized at {self.db_path}")
     
@@ -352,9 +365,13 @@ class Storage:
         server_id: int,
         server_name: str,
         is_healthy: bool,
-        error_message: str = None
+        error_message: str = None,
+        ssh_ok: bool = False,
+        container_running: bool = False,
+        ui_accessible: bool = False,
+        version: str = None
     ):
-        """Update server health status."""
+        """Update server health status with detailed check results."""
         with self._get_connection() as conn:
             now = datetime.now().isoformat()
             
@@ -367,26 +384,30 @@ class Storage:
                 if is_healthy:
                     conn.execute("""
                         UPDATE server_health 
-                        SET is_healthy = 1, last_check = ?, last_healthy = ?,
+                        SET is_healthy = 1, ssh_ok = ?, container_running = ?, 
+                            ui_accessible = ?, version = ?, last_check = ?, last_healthy = ?,
                             error_message = NULL, consecutive_failures = 0, notified = 0
                         WHERE server_id = ?
-                    """, (now, now, server_id))
+                    """, (int(ssh_ok), int(container_running), int(ui_accessible), version, now, now, server_id))
                 else:
                     consecutive = row["consecutive_failures"] + 1
                     conn.execute("""
                         UPDATE server_health 
-                        SET is_healthy = 0, last_check = ?, error_message = ?,
+                        SET is_healthy = 0, ssh_ok = ?, container_running = ?,
+                            ui_accessible = ?, version = ?, last_check = ?, error_message = ?,
                             consecutive_failures = ?
                         WHERE server_id = ?
-                    """, (now, error_message, consecutive, server_id))
+                    """, (int(ssh_ok), int(container_running), int(ui_accessible), version, now, error_message, consecutive, server_id))
             else:
                 # Insert new record
                 last_healthy = now if is_healthy else None
                 conn.execute("""
                     INSERT INTO server_health 
-                    (server_id, server_name, is_healthy, last_check, last_healthy, error_message, consecutive_failures)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (server_id, server_name, int(is_healthy), now, last_healthy, error_message, 0 if is_healthy else 1))
+                    (server_id, server_name, is_healthy, ssh_ok, container_running, ui_accessible, 
+                     version, last_check, last_healthy, error_message, consecutive_failures)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (server_id, server_name, int(is_healthy), int(ssh_ok), int(container_running), 
+                      int(ui_accessible), version, now, last_healthy, error_message, 0 if is_healthy else 1))
     
     def get_server_health(self, server_id: int) -> Optional[dict]:
         """Get health status for a server."""

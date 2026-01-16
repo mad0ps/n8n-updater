@@ -12,10 +12,7 @@ def get_main_menu(has_servers: bool = True) -> InlineKeyboardMarkup:
     
     if has_servers:
         builder.row(
-            InlineKeyboardButton(text="📊 Статус серверов", callback_data="status"),
-        )
-        builder.row(
-            InlineKeyboardButton(text="🔍 Проверить обновления", callback_data="check"),
+            InlineKeyboardButton(text="📊 Статус", callback_data="status"),
         )
         builder.row(
             InlineKeyboardButton(text="🔄 Обновить серверы", callback_data="update_menu"),
@@ -384,6 +381,20 @@ def get_rollback_result_keyboard() -> InlineKeyboardMarkup:
     
     builder.row(
         InlineKeyboardButton(text="📊 Статус серверов", callback_data="status"),
+    )
+    builder.row(
+        InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu"),
+    )
+    
+    return builder.as_markup()
+
+
+def get_status_keyboard() -> InlineKeyboardMarkup:
+    """Get keyboard for cached status view."""
+    builder = InlineKeyboardBuilder()
+    
+    builder.row(
+        InlineKeyboardButton(text="🔄 Обновить данные", callback_data="refresh_all"),
     )
     builder.row(
         InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu"),

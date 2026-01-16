@@ -35,6 +35,7 @@ from .keyboards import (
     get_history_detail_keyboard,
     get_rollback_keyboard,
     get_rollback_result_keyboard,
+    get_status_keyboard,
 )
 
 if TYPE_CHECKING:
@@ -234,17 +235,68 @@ async def cb_cancel(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "status")
 @admin_only
 async def cb_status(callback: CallbackQuery):
-    """Show server statuses."""
+    """Show cached server statuses."""
     await callback.answer()
+    await show_status(callback.message, edit=True)
+
+
+@router.callback_query(F.data == "refresh_all")
+@admin_only
+async def cb_refresh_all(callback: CallbackQuery):
+    """Run live health check and version check."""
+    await callback.answer("Обновляю данные...")
+    await callback.message.edit_text("🔄 Обновляю данные...\n\n• Проверяю серверы...\n• Проверяю версию n8n...")
+    
+    storage = get_storage()
+    servers = storage.get_all_servers()
+    
+    # Run health checks and version check in parallel
+    health_tasks = [perform_full_health_check(server) for server in servers]
+    version_task = get_latest_version()
+    
+    # Execute all tasks
+    all_results = await asyncio.gather(version_task, *health_tasks, return_exceptions=True)
+    
+    latest_version = all_results[0] if not isinstance(all_results[0], Exception) else None
+    health_results = all_results[1:]
+    
+    # Save health results
+    for i, result in enumerate(health_results):
+        if isinstance(result, Exception):
+            storage.update_server_health(
+                server_id=servers[i].id,
+                server_name=servers[i].name,
+                is_healthy=False,
+                error_message=str(result)
+            )
+        else:
+            storage.update_server_health(
+                server_id=servers[i].id,
+                server_name=servers[i].name,
+                is_healthy=result.is_healthy,
+                error_message=result.error,
+                ssh_ok=result.ssh_ok,
+                container_running=result.container_running,
+                ui_accessible=result.ui_accessible,
+                version=result.version
+            )
+    
+    # Save version check time
+    from datetime import datetime
+    storage.set_setting("last_version_check", datetime.now().isoformat())
+    if latest_version:
+        storage.set_last_known_version(str(latest_version))
+    
+    # Show updated status
     await show_status(callback.message, edit=True)
 
 
 @router.callback_query(F.data == "check")
 @admin_only
 async def cb_check(callback: CallbackQuery):
-    """Check for updates."""
+    """Legacy: redirect to status."""
     await callback.answer()
-    await check_updates(callback.message, edit=True)
+    await show_status(callback.message, edit=True)
 
 
 @router.callback_query(F.data == "update_menu")
@@ -1361,25 +1413,142 @@ async def cb_confirm_update(callback: CallbackQuery, state: FSMContext):
 
 # ============= Helper Functions =============
 
+def _format_time_ago(iso_time: str) -> str:
+    """Format ISO timestamp as relative time string."""
+    if not iso_time:
+        return "нет данных"
+    try:
+        check_time = datetime.fromisoformat(iso_time)
+        now = datetime.now()
+        diff = now - check_time
+        
+        if diff.total_seconds() < 60:
+            return "только что"
+        elif diff.total_seconds() < 3600:
+            mins = int(diff.total_seconds() / 60)
+            return f"{mins} мин назад"
+        elif diff.total_seconds() < 86400:
+            hours = int(diff.total_seconds() / 3600)
+            return f"{hours} ч назад"
+        else:
+            days = int(diff.total_seconds() / 86400)
+            return f"{days} дн назад"
+    except:
+        return "неизвестно"
+
+
 async def show_status(message: Message, edit: bool = False):
-    """Show status of all servers."""
+    """Show cached status of all servers from monitoring with version info."""
     storage = get_storage()
     servers = storage.get_all_servers()
     
     if not servers:
-        text = "📊 *Статус серверов*\n\nУ тебя пока нет серверов."
+        text = "📊 *Статус*\n\nУ тебя пока нет серверов."
         if edit:
             await message.edit_text(text, parse_mode="Markdown", reply_markup=get_servers_menu())
         else:
             await message.answer(text, parse_mode="Markdown", reply_markup=get_servers_menu())
         return
     
-    # Show loading message
-    loading_text = "🔄 Проверяю статус серверов..."
-    if edit:
-        await message.edit_text(loading_text)
+    # Get cached health data
+    health_data = storage.get_all_server_health()
+    health_by_id = {h["server_id"]: h for h in health_data}
+    
+    # Get last known version and check time
+    last_known_version = storage.get_last_known_version()
+    last_version_check = storage.get_setting("last_version_check")
+    version_check_time = _format_time_ago(last_version_check) if last_version_check else "не проверялось"
+    
+    # Check if monitoring is enabled
+    monitoring_enabled = storage.get_setting("monitoring_enabled", "0") == "1"
+    
+    # Format status message
+    lines = ["📊 *Статус*\n"]
+    
+    # Version info header
+    if last_known_version:
+        lines.append(f"🔄 Последняя версия n8n: `{last_known_version}`")
+        lines.append(f"   └ Проверено: {version_check_time}\n")
     else:
-        message = await message.answer(loading_text)
+        lines.append("🔄 Версия n8n: _не проверялась_\n")
+    
+    if not monitoring_enabled:
+        lines.append("⚠️ _Мониторинг выключен_\n")
+    
+    for server in servers:
+        health = health_by_id.get(server.id)
+        
+        if health:
+            is_healthy = health.get("is_healthy", False)
+            last_check = health.get("last_check")
+            error_msg = health.get("error_message", "")
+            failures = health.get("consecutive_failures", 0)
+            
+            # Get detailed check results
+            ssh_ok = health.get("ssh_ok", False)
+            container_ok = health.get("container_running", False)
+            ui_ok = health.get("ui_accessible", False)
+            version = health.get("version")
+            
+            time_str = _format_time_ago(last_check)
+            status_icon = "🟢" if is_healthy else "🔴"
+            
+            # Build check status line: SSH: ✓ | Docker: ✓ | UI: ✓
+            ssh_mark = "✓" if ssh_ok else "✗"
+            docker_mark = "✓" if container_ok else "✗"
+            ui_mark = "✓" if ui_ok else "—" if not server.n8n_url else "✗"
+            
+            checks_line = f"SSH: {ssh_mark} | Docker: {docker_mark} | UI: {ui_mark}"
+            
+            # Version with update badge
+            version_str = ""
+            if version:
+                version_str = f"v{version}"
+                if last_known_version and compare_versions(version, last_known_version) < 0:
+                    version_str += " ⬆️"
+                elif last_known_version and compare_versions(version, last_known_version) == 0:
+                    version_str += " ✅"
+            
+            if is_healthy:
+                server_block = f"{status_icon} *{server.name}*\n   └ 🕐 {time_str}\n   └ {checks_line}"
+                if version_str:
+                    server_block += f"\n   └ {version_str}"
+                lines.append(server_block)
+            else:
+                error_short = error_msg[:40] + "..." if error_msg and len(error_msg) > 40 else (error_msg or "")
+                failure_info = f" ({failures}x)" if failures > 1 else ""
+                server_block = f"{status_icon} *{server.name}*\n   └ 🕐 {time_str}\n   └ {checks_line}\n   └ ❌{failure_info} {error_short}"
+                lines.append(server_block)
+        else:
+            # No health data yet
+            lines.append(
+                f"⚪ *{server.name}*\n"
+                f"   └ Ещё не проверялся"
+            )
+    
+    text = "\n".join(lines)
+    
+    if edit:
+        await message.edit_text(text, parse_mode="Markdown", reply_markup=get_status_keyboard())
+    else:
+        await message.answer(text, parse_mode="Markdown", reply_markup=get_status_keyboard())
+
+
+async def show_live_status(message: Message):
+    """Show live status of all servers (with SSH check)."""
+    storage = get_storage()
+    servers = storage.get_all_servers()
+    
+    if not servers:
+        await message.edit_text(
+            "📊 *Статус серверов*\n\nУ тебя пока нет серверов.",
+            parse_mode="Markdown",
+            reply_markup=get_servers_menu()
+        )
+        return
+    
+    # Show loading message
+    await message.edit_text("🔄 Проверяю статус серверов...")
     
     # Get status for all servers in parallel
     tasks = [get_server_status(server) for server in servers]
@@ -1390,7 +1559,7 @@ async def show_status(message: Message, edit: bool = False):
     latest_str = str(latest) if latest else "неизвестно"
     
     # Format status message
-    lines = [f"📊 *Статус серверов*\n\nПоследняя версия n8n: `{latest_str}`\n"]
+    lines = [f"📊 *Статус серверов (live)*\n\nПоследняя версия n8n: `{latest_str}`\n"]
     
     for status in statuses:
         if status["connected"]:
@@ -1419,7 +1588,7 @@ async def show_status(message: Message, edit: bool = False):
     await message.edit_text(
         "\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=get_back_keyboard()
+        reply_markup=get_status_keyboard()
     )
 
 

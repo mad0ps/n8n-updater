@@ -123,8 +123,9 @@ class UpdateScheduler:
                     if cmp < 0:
                         servers_needing_update.append(status)
             
-            # Update last known version
+            # Update last known version and check time
             storage.set_last_known_version(latest_str)
+            storage.set_setting("last_version_check", datetime.now().isoformat())
             
             # If we have a new version and servers need updating, notify
             if last_known is None:
@@ -378,12 +379,16 @@ class UpdateScheduler:
             try:
                 result = await perform_full_health_check(server)
                 
-                # Update health status in database
+                # Update health status in database with all details
                 storage.update_server_health(
                     server_id=server.id,
                     server_name=server.name,
                     is_healthy=result.is_healthy,
-                    error_message=result.error
+                    error_message=result.error,
+                    ssh_ok=result.ssh_ok,
+                    container_running=result.container_running,
+                    ui_accessible=result.ui_accessible,
+                    version=result.version
                 )
                 
                 if result.is_healthy:
