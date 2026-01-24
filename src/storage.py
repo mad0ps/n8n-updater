@@ -311,7 +311,15 @@ class Storage:
     def set_last_known_version(self, version: str):
         """Set last known n8n version."""
         self.set_setting("last_known_version", version)
-    
+
+    def get_verbose_updates(self) -> bool:
+        """Get verbose updates setting."""
+        return self.get_setting("verbose_updates", "0") == "1"
+
+    def set_verbose_updates(self, enabled: bool):
+        """Set verbose updates setting."""
+        self.set_setting("verbose_updates", "1" if enabled else "0")
+
     # ============= Update History =============
     
     def add_update_history(

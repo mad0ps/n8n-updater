@@ -252,7 +252,7 @@ def get_back_keyboard() -> InlineKeyboardMarkup:
 def get_settings_keyboard() -> InlineKeyboardMarkup:
     """Get settings menu keyboard."""
     builder = InlineKeyboardBuilder()
-    
+
     builder.row(
         InlineKeyboardButton(text="⏱ Интервал проверки", callback_data="setting:interval"),
     )
@@ -260,9 +260,32 @@ def get_settings_keyboard() -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="🩺 Мониторинг серверов", callback_data="setting:monitoring"),
     )
     builder.row(
+        InlineKeyboardButton(text="📝 Подробный вывод", callback_data="setting:verbose"),
+    )
+    builder.row(
         InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu"),
     )
-    
+
+    return builder.as_markup()
+
+
+def get_verbose_keyboard(enabled: bool = False) -> InlineKeyboardMarkup:
+    """Get verbose mode settings keyboard."""
+    builder = InlineKeyboardBuilder()
+
+    if enabled:
+        builder.row(
+            InlineKeyboardButton(text="🔴 Выключить", callback_data="verbose:disable"),
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(text="🟢 Включить", callback_data="verbose:enable"),
+        )
+
+    builder.row(
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_menu"),
+    )
+
     return builder.as_markup()
 
 

@@ -5,7 +5,7 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable, Awaitable
 
 import aiohttp
 import paramiko
@@ -14,6 +14,10 @@ from .storage import Server
 from .version_checker import parse_version
 
 logger = logging.getLogger(__name__)
+
+
+# Progress callback type: async function(step: int, total: int, message: str)
+ProgressCallback = Callable[[int, int, str], Awaitable[None]]
 
 
 @dataclass
@@ -230,10 +234,17 @@ class SSHExecutor:
         result = await self.execute(f"test -d {self.server.n8n_path}", timeout=10)
         return result.success
     
-    async def update_n8n(self) -> UpdateResult:
+    async def update_n8n(
+        self,
+        progress_callback: Optional[ProgressCallback] = None
+    ) -> UpdateResult:
         """
         Update n8n to the latest version.
-        
+
+        Args:
+            progress_callback: Optional async callback for progress updates.
+                              Called with (step, total_steps, message).
+
         Returns:
             UpdateResult with status and details.
         """
@@ -243,19 +254,32 @@ class SSHExecutor:
         compose_backup_path = None
         data_backup_path = None
         old_version = None
-        
+
+        # Total steps for progress tracking
+        total_steps = 8
+
+        async def report_progress(step: int, message: str):
+            """Report progress if callback is provided."""
+            if progress_callback:
+                try:
+                    await progress_callback(step, total_steps, message)
+                except Exception as e:
+                    logger.warning(f"Progress callback failed: {e}")
+
         try:
-            # Get current version before update
+            # Step 1: Get current version
+            await report_progress(1, "Получение текущей версии...")
             old_version = await self.get_current_version()
             details_parts.append(f"Old version: {old_version or 'unknown'}")
-            
-            # === BACKUP N8N DATA ===
+
+            # Step 2: Backup data
+            await report_progress(2, "Создание бэкапа данных...")
             logger.info(f"[{server_name}] Creating backup of n8n data...")
-            
+
             # Get real timestamp from server
             timestamp_result = await self.execute("date +%Y%m%d_%H%M%S", timeout=10)
             timestamp = timestamp_result.stdout.strip() if timestamp_result.success else "backup"
-            
+
             # Find n8n data directory (check common locations)
             find_data_cmd = f"""
             cd {self.server.n8n_path} && \
@@ -266,16 +290,11 @@ class SSHExecutor:
             """
             result = await self.execute(find_data_cmd, timeout=30)
             data_dir = result.stdout.strip() if result.success else ""
-            
+
             # Create backup directory
             backup_dir = f"{self.server.n8n_path}/backups"
             await self.execute(f"mkdir -p {backup_dir}", timeout=30)
-            
-            # Backup docker-compose.yml
-            compose_backup_path = f"{backup_dir}/docker-compose.yml.{timestamp}"
-            backup_compose_cmd = f"cd {self.server.n8n_path} && cp docker-compose.yml {compose_backup_path}"
-            await self.execute(backup_compose_cmd, timeout=30)
-            
+
             # Backup n8n data if found
             if data_dir:
                 data_backup_path = f"{backup_dir}/n8n_backup_{timestamp}.tar.gz"
@@ -290,41 +309,44 @@ class SSHExecutor:
                     logger.warning(f"[{server_name}] Backup failed: {result.stderr}")
             else:
                 details_parts.append("No data dir found, skipping data backup")
-            
+
+            # Step 3: Backup config
+            await report_progress(3, "Создание бэкапа конфига...")
+            compose_backup_path = f"{backup_dir}/docker-compose.yml.{timestamp}"
+            backup_compose_cmd = f"cd {self.server.n8n_path} && cp docker-compose.yml {compose_backup_path}"
+            await self.execute(backup_compose_cmd, timeout=30)
             details_parts.append(f"Config backup: {compose_backup_path}")
-            
-            # === UPDATE DOCKER-COMPOSE.YML ===
+
+            # Step 4: Update docker-compose.yml
+            await report_progress(4, "Обновление конфигурации...")
             logger.info(f"[{server_name}] Updating image tag to latest...")
-            
+
             # First, let's see current image line
             check_image_cmd = f"cd {self.server.n8n_path} && grep -E 'image.*n8n' docker-compose.yml"
             result = await self.execute(check_image_cmd, timeout=30)
             current_image = result.stdout.strip()
             logger.info(f"[{server_name}] Current image line: {current_image}")
             details_parts.append(f"Current: {current_image}")
-            
+
             # Update image to use Docker Hub (not docker.n8n.io which lags behind)
-            # Replace docker.n8n.io/n8nio/n8n with n8nio/n8n:latest
-            # This ensures we get the latest version from Docker Hub
-            
-            # Replace docker.n8n.io/n8nio/n8n... with n8nio/n8n:latest
             update_cmd = f"cd {self.server.n8n_path} && sed -i.bak -E 's|docker\\.n8n\\.io/n8nio/n8n(:[^ ]*)?|n8nio/n8n:latest|g' docker-compose.yml"
-            result = await self.execute(update_cmd, timeout=30)
-            
+            await self.execute(update_cmd, timeout=30)
+
             # Also handle if it was already n8nio/n8n without docker.n8n.io prefix
             update_cmd2 = f"cd {self.server.n8n_path} && sed -i.bak -E 's|([^/])n8nio/n8n(:[^ ]*)?|\\1n8nio/n8n:latest|g' docker-compose.yml"
             await self.execute(update_cmd2, timeout=30)
-            
+
             # Check what it looks like now
             check_image_cmd = f"cd {self.server.n8n_path} && grep -E 'image.*n8n' docker-compose.yml"
             result = await self.execute(check_image_cmd, timeout=30)
             new_image = result.stdout.strip()
             logger.info(f"[{server_name}] Updated image line: {new_image}")
             details_parts.append(f"Updated to: {new_image}")
-            
-            # === PULL NEW IMAGE ===
+
+            # Step 5: Pull new image (longest step)
+            await report_progress(5, "Скачивание образа...")
             logger.info(f"[{server_name}] Pulling new n8n image from Docker Hub...")
-            
+
             # Force pull from Docker Hub (not docker.n8n.io which lags behind!)
             force_pull_cmd = "docker pull n8nio/n8n:latest 2>&1"
             result = await self.execute(force_pull_cmd, timeout=600)
@@ -333,11 +355,11 @@ class SSHExecutor:
                 details_parts.append("Latest image pulled")
             else:
                 logger.warning(f"[{server_name}] Force pull failed: {result.stderr}")
-            
+
             # Now do compose pull
             pull_cmd = f"cd {self.server.n8n_path} && docker compose pull 2>&1 || docker-compose pull 2>&1"
             result = await self.execute(pull_cmd, timeout=600)  # 10 min for pull
-            
+
             if not result.success:
                 return UpdateResult(
                     server_name=server_name,
@@ -352,12 +374,13 @@ class SSHExecutor:
                     can_rollback=bool(compose_backup_path)
                 )
             details_parts.append("Image pulled successfully")
-            
-            # Stop containers
+
+            # Step 6: Stop containers
+            await report_progress(6, "Остановка контейнеров...")
             logger.info(f"[{server_name}] Stopping n8n...")
             down_cmd = f"cd {self.server.n8n_path} && docker compose down 2>&1 || docker-compose down 2>&1"
             result = await self.execute(down_cmd, timeout=120)
-            
+
             if not result.success:
                 return UpdateResult(
                     server_name=server_name,
@@ -372,12 +395,13 @@ class SSHExecutor:
                     can_rollback=bool(compose_backup_path)
                 )
             details_parts.append("Containers stopped")
-            
-            # Start containers
+
+            # Step 7: Start containers
+            await report_progress(7, "Запуск контейнеров...")
             logger.info(f"[{server_name}] Starting n8n...")
             up_cmd = f"cd {self.server.n8n_path} && docker compose up -d 2>&1 || docker-compose up -d 2>&1"
             result = await self.execute(up_cmd, timeout=120)
-            
+
             if not result.success:
                 return UpdateResult(
                     server_name=server_name,
@@ -392,11 +416,12 @@ class SSHExecutor:
                     can_rollback=bool(compose_backup_path)
                 )
             details_parts.append("Containers started")
-            
+
             # Wait for container to be ready
             await asyncio.sleep(10)
-            
-            # Verify n8n is running
+
+            # Step 8: Verify and get new version
+            await report_progress(8, "Проверка...")
             if not await self.check_n8n_running():
                 return UpdateResult(
                     server_name=server_name,
@@ -410,11 +435,11 @@ class SSHExecutor:
                     data_backup_path=data_backup_path,
                     can_rollback=bool(compose_backup_path)
                 )
-            
+
             # Get new version
             new_version = await self.get_current_version()
             details_parts.append(f"New version: {new_version or 'unknown'}")
-            
+
             return UpdateResult(
                 server_name=server_name,
                 server_id=server_id,
@@ -427,7 +452,7 @@ class SSHExecutor:
                 data_backup_path=data_backup_path,
                 can_rollback=False  # Success - no rollback needed
             )
-            
+
         except Exception as e:
             logger.exception(f"[{server_name}] Update failed with exception")
             return UpdateResult(

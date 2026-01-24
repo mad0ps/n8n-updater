@@ -3,6 +3,7 @@
 import asyncio
 import functools
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -31,6 +32,7 @@ from .keyboards import (
     get_skip_keyboard,
     get_cancel_keyboard,
     get_monitoring_keyboard,
+    get_verbose_keyboard,
     get_history_keyboard,
     get_history_detail_keyboard,
     get_rollback_keyboard,
@@ -1055,13 +1057,16 @@ async def cb_settings_menu(callback: CallbackQuery):
     storage = get_storage()
     interval = storage.get_check_interval()
     monitoring_enabled = storage.get_setting("monitoring_enabled", "0") == "1"
-    
+    verbose_enabled = storage.get_verbose_updates()
+
     monitoring_status = "🟢 Включён" if monitoring_enabled else "🔴 Выключен"
-    
+    verbose_status = "🟢 Включён" if verbose_enabled else "🔴 Выключен"
+
     await callback.message.edit_text(
         f"⚙️ *Настройки*\n\n"
         f"**Интервал проверки обновлений:** {interval} ч\n"
-        f"**Мониторинг серверов:** {monitoring_status}",
+        f"**Мониторинг серверов:** {monitoring_status}\n"
+        f"**Подробный вывод:** {verbose_status}",
         parse_mode="Markdown",
         reply_markup=get_settings_keyboard()
     )
@@ -1158,6 +1163,56 @@ async def cb_toggle_monitoring(callback: CallbackQuery):
             reply_markup=get_back_keyboard()
         )
     
+    await callback.answer()
+
+
+# ============= Verbose Mode Handlers =============
+
+@router.callback_query(F.data == "setting:verbose")
+@admin_only
+async def cb_setting_verbose(callback: CallbackQuery):
+    """Show verbose mode settings."""
+    storage = get_storage()
+    verbose_enabled = storage.get_verbose_updates()
+
+    status = "🟢 Включён" if verbose_enabled else "🔴 Выключен"
+
+    await callback.message.edit_text(
+        f"📝 *Подробный вывод*\n\n"
+        f"**Статус:** {status}\n\n"
+        f"Когда включён, при обновлении показывается:\n"
+        f"• Текущий шаг (бэкап → pull → restart)\n"
+        f"• Таймер с начала процесса\n"
+        f"• Детальный прогресс по шагам",
+        parse_mode="Markdown",
+        reply_markup=get_verbose_keyboard(enabled=verbose_enabled)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("verbose:"))
+@admin_only
+async def cb_toggle_verbose(callback: CallbackQuery):
+    """Toggle verbose mode on/off."""
+    action = callback.data.split(":")[1]
+    storage = get_storage()
+
+    if action == "enable":
+        storage.set_verbose_updates(True)
+        await callback.message.edit_text(
+            "✅ *Подробный вывод включён!*\n\n"
+            "Теперь при обновлении будет показываться детальный прогресс.",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard()
+        )
+    else:
+        storage.set_verbose_updates(False)
+        await callback.message.edit_text(
+            "🔴 *Подробный вывод выключен*",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard()
+        )
+
     await callback.answer()
 
 
@@ -1703,11 +1758,19 @@ async def start_update_flow(message: Message, state: FSMContext, edit: bool = Fa
         )
 
 
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds to mm:ss format."""
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{minutes}:{secs:02d}"
+
+
 async def execute_updates(message: Message, server_names: list[str], edit: bool = False):
     """Execute updates on selected servers."""
     storage = get_storage()
     servers = [s for s in storage.get_all_servers() if s.name in server_names]
-    
+    verbose_mode = storage.get_verbose_updates()
+
     if not servers:
         text = "❌ Ошибка: серверы не найдены"
         if edit:
@@ -1715,30 +1778,88 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
         else:
             await message.answer(text, reply_markup=get_back_keyboard())
         return
-    
+
     # Show progress
     text = f"🔄 *Обновление {len(servers)} сервера(ов)*\n\nЭто может занять несколько минут..."
     if edit:
         await message.edit_text(text, parse_mode="Markdown")
     else:
         message = await message.answer(text, parse_mode="Markdown")
-    
+
     # Execute updates
     results: list[UpdateResult] = []
     failed_with_rollback: list[tuple[UpdateResult, int]] = []  # (result, backup_id)
-    
+
+    # Track completed steps for verbose mode
+    completed_steps: dict[str, list[tuple[int, str]]] = {}  # server_name -> [(step, message)]
+
     for server in servers:
-        await message.edit_text(
-            f"🔄 *Обновление серверов*\n\n"
-            f"Текущий: {server.name}...\n"
-            f"Завершено: {len(results)}/{len(servers)}",
-            parse_mode="Markdown"
-        )
-        
+        start_time = time.time()
+        completed_steps[server.name] = []
+
+        # Progress callback for verbose mode
+        async def progress_callback(step: int, total: int, step_message: str):
+            if not verbose_mode:
+                return
+
+            elapsed = time.time() - start_time
+            completed_steps[server.name].append((step, step_message))
+
+            # Build progress display
+            lines = [
+                f"🔄 *Обновление серверов*",
+                f"",
+                f"*{server.name}* • ⏱️ {format_duration(elapsed)}",
+                f"",
+            ]
+
+            # Progress bar
+            progress_bar = ""
+            for i in range(1, total + 1):
+                if i < step:
+                    progress_bar += "✅"
+                elif i == step:
+                    progress_bar += "🔄"
+                else:
+                    progress_bar += "⏳"
+
+            lines.append(f"{progress_bar} {step}/{total}")
+            lines.append(f"")
+            lines.append(f"📍 {step_message}")
+
+            # Show completed steps
+            if len(completed_steps[server.name]) > 1:
+                lines.append(f"")
+                for prev_step, prev_msg in completed_steps[server.name][:-1]:
+                    lines.append(f"  ✓ {prev_msg}")
+
+            # Show overall progress
+            lines.append(f"")
+            lines.append(f"Серверов: {len(results)}/{len(servers)}")
+
+            try:
+                await message.edit_text(
+                    "\n".join(lines),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass  # Ignore edit errors (rate limiting, etc)
+
+        # Show simple progress for non-verbose mode
+        if not verbose_mode:
+            await message.edit_text(
+                f"🔄 *Обновление серверов*\n\n"
+                f"Текущий: {server.name}...\n"
+                f"Завершено: {len(results)}/{len(servers)}",
+                parse_mode="Markdown"
+            )
+
         executor = SSHExecutor(server)
-        result = await executor.update_n8n()
+        result = await executor.update_n8n(
+            progress_callback=progress_callback if verbose_mode else None
+        )
         results.append(result)
-        
+
         # Save backup info if available
         backup_id = None
         if result.compose_backup_path:
@@ -1751,11 +1872,11 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
             )
             # Clean up old backups (keep last 3)
             storage.delete_old_backups(server.id, keep_count=3)
-        
+
         # Track failed updates that can be rolled back
         if not result.success and result.can_rollback and backup_id:
             failed_with_rollback.append((result, backup_id))
-        
+
         # Save to history
         storage.add_update_history(
             server_id=server.id,
@@ -1766,13 +1887,13 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
             message=result.message,
             details=result.details
         )
-    
+
     # Format results
     lines = ["🏁 *Результаты обновления*\n"]
-    
+
     success_count = sum(1 for r in results if r.success)
     lines.append(f"Успешно: {success_count}/{len(results)}\n")
-    
+
     for result in results:
         if result.success:
             version_change = ""
@@ -1784,13 +1905,13 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
             lines.append(f"✅ *{result.server_name}*{version_change}")
         else:
             lines.append(f"❌ *{result.server_name}*: {result.message}")
-    
+
     await message.edit_text(
         "\n".join(lines),
         parse_mode="Markdown",
         reply_markup=get_back_keyboard()
     )
-    
+
     # Offer rollback for failed updates
     for result, backup_id in failed_with_rollback:
         server = storage.get_server_by_name(result.server_name)
@@ -1803,5 +1924,5 @@ async def execute_updates(message: Message, server_names: list[str], edit: bool 
                 parse_mode="Markdown",
                 reply_markup=get_rollback_keyboard(server.id, backup_id)
             )
-    
+
     return results
